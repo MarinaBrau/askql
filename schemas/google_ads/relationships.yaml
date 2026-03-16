@@ -1,0 +1,148 @@
+source_name: google_ads
+description: >
+  Relacionamentos entre tabelas Stats (metricas) e Config (dimensoes) do
+  Google Ads Data Transfer. Config tables tem snapshots diarios — sempre
+  deduplicar com ROW_NUMBER antes de JOIN.
+
+relationships:
+  - name: "campaign_stats_to_campaign"
+    from_table: "ads_CampaignStats_*"
+    to_table: "ads_Campaign_*"
+    join_key: "campaign_id"
+    cardinality: "N:1"
+    requires_dedup: true
+    dedup_partition_by: "campaign_id"
+    dedup_order_by: "_TABLE_SUFFIX DESC"
+    useful_fields: [campaign_name, campaign_advertising_channel_type, campaign_status, campaign_bidding_strategy_type]
+    gotcha: "ads_Campaign_* has daily snapshots — deduplicate with ROW_NUMBER before JOIN to avoid metric inflation"
+    example_sql: |
+      WITH campaign_dedup AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+        FROM `{project_id}.{dataset}.ads_Campaign_*`
+      )
+      SELECT
+        c.campaign_name,
+        SUM(s.metrics_cost_micros) / 1000000.0 AS custo
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*` s
+      JOIN campaign_dedup c ON s.campaign_id = c.campaign_id AND c.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY c.campaign_name
+
+  - name: "adgroup_stats_to_adgroup"
+    from_table: "ads_AdGroupStats_*"
+    to_table: "ads_AdGroup_*"
+    join_key: "ad_group_id"
+    cardinality: "N:1"
+    requires_dedup: true
+    dedup_partition_by: "ad_group_id"
+    dedup_order_by: "_TABLE_SUFFIX DESC"
+    useful_fields: [ad_group_name, ad_group_status, ad_group_type]
+    gotcha: "ads_AdGroup_* has daily snapshots — deduplicate with ROW_NUMBER before JOIN"
+    example_sql: |
+      WITH adgroup_dedup AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY ad_group_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+        FROM `{project_id}.{dataset}.ads_AdGroup_*`
+      )
+      SELECT
+        ag.ad_group_name,
+        SUM(s.metrics_cost_micros) / 1000000.0 AS custo
+      FROM `{project_id}.{dataset}.ads_AdGroupStats_*` s
+      JOIN adgroup_dedup ag ON s.ad_group_id = ag.ad_group_id AND ag.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY ag.ad_group_name
+
+  - name: "adgroup_stats_to_campaign"
+    from_table: "ads_AdGroupStats_*"
+    to_table: "ads_Campaign_*"
+    join_key: "campaign_id"
+    cardinality: "N:1"
+    requires_dedup: true
+    dedup_partition_by: "campaign_id"
+    dedup_order_by: "_TABLE_SUFFIX DESC"
+    useful_fields: [campaign_name, campaign_advertising_channel_type, campaign_status]
+    gotcha: "ads_Campaign_* has daily snapshots — deduplicate with ROW_NUMBER before JOIN"
+    example_sql: |
+      WITH campaign_dedup AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+        FROM `{project_id}.{dataset}.ads_Campaign_*`
+      )
+      SELECT
+        c.campaign_name,
+        ag.ad_group_id,
+        SUM(s.metrics_cost_micros) / 1000000.0 AS custo
+      FROM `{project_id}.{dataset}.ads_AdGroupStats_*` s
+      JOIN campaign_dedup c ON s.campaign_id = c.campaign_id AND c.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY c.campaign_name, ag.ad_group_id
+
+  - name: "keyword_stats_to_adgroup"
+    from_table: "ads_KeywordStats_*"
+    to_table: "ads_AdGroup_*"
+    join_key: "ad_group_id"
+    cardinality: "N:1"
+    requires_dedup: true
+    dedup_partition_by: "ad_group_id"
+    dedup_order_by: "_TABLE_SUFFIX DESC"
+    useful_fields: [ad_group_name, ad_group_status, ad_group_type]
+    gotcha: "ads_AdGroup_* has daily snapshots — deduplicate with ROW_NUMBER before JOIN"
+    example_sql: |
+      WITH adgroup_dedup AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY ad_group_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+        FROM `{project_id}.{dataset}.ads_AdGroup_*`
+      )
+      SELECT
+        ag.ad_group_name,
+        s.keyword_text,
+        SUM(s.metrics_clicks) AS cliques
+      FROM `{project_id}.{dataset}.ads_KeywordStats_*` s
+      JOIN adgroup_dedup ag ON s.ad_group_id = ag.ad_group_id AND ag.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY ag.ad_group_name, s.keyword_text
+
+  - name: "ad_stats_to_adgroup"
+    from_table: "ads_AdStats_*"
+    to_table: "ads_AdGroup_*"
+    join_key: "ad_group_id"
+    cardinality: "N:1"
+    requires_dedup: true
+    dedup_partition_by: "ad_group_id"
+    dedup_order_by: "_TABLE_SUFFIX DESC"
+    useful_fields: [ad_group_name, ad_group_status, ad_group_type]
+    gotcha: "ads_AdGroup_* has daily snapshots — deduplicate with ROW_NUMBER before JOIN"
+    example_sql: |
+      WITH adgroup_dedup AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY ad_group_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+        FROM `{project_id}.{dataset}.ads_AdGroup_*`
+      )
+      SELECT
+        ag.ad_group_name,
+        s.ad_id,
+        SUM(s.metrics_impressions) AS impressoes
+      FROM `{project_id}.{dataset}.ads_AdStats_*` s
+      JOIN adgroup_dedup ag ON s.ad_group_id = ag.ad_group_id AND ag.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY ag.ad_group_name, s.ad_id
+
+  - name: "ad_stats_to_campaign"
+    from_table: "ads_AdStats_*"
+    to_table: "ads_Campaign_*"
+    join_key: "campaign_id"
+    cardinality: "N:1"
+    requires_dedup: true
+    dedup_partition_by: "campaign_id"
+    dedup_order_by: "_TABLE_SUFFIX DESC"
+    useful_fields: [campaign_name, campaign_advertising_channel_type, campaign_status]
+    gotcha: "ads_Campaign_* has daily snapshots — deduplicate with ROW_NUMBER before JOIN"
+    example_sql: |
+      WITH campaign_dedup AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+        FROM `{project_id}.{dataset}.ads_Campaign_*`
+      )
+      SELECT
+        c.campaign_name,
+        s.ad_id,
+        SUM(s.metrics_cost_micros) / 1000000.0 AS custo
+      FROM `{project_id}.{dataset}.ads_AdStats_*` s
+      JOIN campaign_dedup c ON s.campaign_id = c.campaign_id AND c.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY c.campaign_name, s.ad_id

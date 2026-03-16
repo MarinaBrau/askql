@@ -1,0 +1,205 @@
+source_name: meta_ads
+description: >
+  Gotchas criticos para gerar SQL correto sobre tabelas do Meta Ads
+  (Facebook/Instagram) no BigQuery.
+
+gotchas:
+  - id: 1
+    title: "spend ja esta em moeda real (NAO dividir por 1M)"
+    severity: critical
+    description: >
+      Diferente do Google Ads (que usa micros), o Meta Ads armazena o campo
+      spend ja em moeda real (ex: 150.50 = R$ 150,50). Se voce dividir por
+      1.000.000 (habito de quem vem do Google Ads), os valores ficarao
+      praticamente zero — um erro catastrofico em relatorios de investimento.
+    correct_example: |
+      -- Gasto total por campanha (valor ja em moeda real)
+      SELECT
+        campaign_name,
+        ROUND(SUM(spend), 2) AS gasto_total
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+      ORDER BY gasto_total DESC
+    incorrect_example: |
+      -- ERRADO: dividindo spend por 1M (habito do Google Ads!)
+      SELECT
+        campaign_name,
+        SUM(spend) / 1000000.0 AS gasto_total
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+
+  - id: 2
+    title: "Usar _TABLE_SUFFIX para filtrar datas em tabelas sharded"
+    severity: critical
+    description: >
+      As tabelas de insights do Meta Ads usam sharding por data no formato
+      meta_ads_insights_*_YYYYMMDD. Para filtrar por periodo, use _TABLE_SUFFIX
+      com formato YYYYMMDD (string sem hifens). Isso e essencial para performance
+      e controle de custo — sem esse filtro, o BigQuery escaneia TODAS as particoes.
+    correct_example: |
+      -- Filtro correto usando _TABLE_SUFFIX (formato YYYYMMDD)
+      SELECT *
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+    incorrect_example: |
+      -- ERRADO: sem _TABLE_SUFFIX — escaneia TODAS as particoes (custo alto!)
+      SELECT *
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE date_start BETWEEN '2026-01-01' AND '2026-01-31'
+
+      -- ERRADO: formato com hifens no _TABLE_SUFFIX
+      SELECT *
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '2026-01-01' AND '2026-01-31'
+
+  - id: 3
+    title: "actions e ARRAY — requer UNNEST para extrair conversoes"
+    severity: critical
+    description: >
+      O campo actions e do tipo ARRAY<STRUCT<action_type STRING, value FLOAT64>>.
+      Para acessar conversoes (purchases, leads, etc.), voce DEVE usar UNNEST.
+      Sem UNNEST, a query falha ou retorna resultados errados. Use o padrao de
+      subquery correlata para extrair um action_type especifico.
+    correct_example: |
+      -- Extrair purchases de actions via UNNEST (subquery correlata)
+      SELECT
+        campaign_name,
+        ROUND(SUM(spend), 2) AS gasto,
+        SUM(
+          (SELECT COALESCE(SUM(a.value), 0) FROM UNNEST(actions) a WHERE a.action_type = 'purchase')
+        ) AS compras
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+    incorrect_example: |
+      -- ERRADO: acessando actions.purchase diretamente (nao e STRUCT simples!)
+      SELECT
+        campaign_name,
+        SUM(actions.purchase) AS compras
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+
+  - id: 4
+    title: "action_values e ARRAY — requer UNNEST para valor de conversoes"
+    severity: critical
+    description: >
+      O campo action_values segue a mesma estrutura de actions
+      (ARRAY<STRUCT<action_type STRING, value FLOAT64>>). Use UNNEST para
+      extrair o valor monetario de conversoes. Essencial para calcular ROAS
+      (Return on Ad Spend). Os action_types sao os mesmos de actions.
+    correct_example: |
+      -- ROAS: valor de purchases / gasto (usando action_values)
+      SELECT
+        campaign_name,
+        ROUND(SUM(spend), 2) AS gasto,
+        ROUND(
+          SUM(
+            (SELECT COALESCE(SUM(av.value), 0) FROM UNNEST(action_values) av WHERE av.action_type = 'purchase')
+          )
+          / NULLIF(SUM(spend), 0),
+          2
+        ) AS roas
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+    incorrect_example: |
+      -- ERRADO: acessando action_values como campo escalar
+      SELECT
+        campaign_name,
+        SUM(action_values.purchase) / SUM(spend) AS roas
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      GROUP BY campaign_name
+
+  - id: 5
+    title: "link_clicks vs clicks — usar link_clicks para CTR real"
+    severity: high
+    description: >
+      O Meta Ads tem dois campos de cliques: `clicks` (TODOS os cliques, incluindo
+      curtidas, comentarios, compartilhamentos e cliques no link) e `link_clicks`
+      (APENAS cliques no link do anuncio). Para medir eficiencia de trafego
+      (CTR de link), use link_clicks. O campo clicks superestima o engajamento
+      com o anuncio como gerador de trafego.
+    correct_example: |
+      -- CTR de link (metrica mais relevante para trafego)
+      SELECT
+        campaign_name,
+        SUM(link_clicks) AS cliques_no_link,
+        SUM(impressions) AS impressoes,
+        ROUND(
+          SUM(link_clicks) * 100.0
+          / NULLIF(SUM(impressions), 0),
+          2
+        ) AS ctr_link_pct
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+    incorrect_example: |
+      -- CUIDADO: clicks inclui curtidas e comentarios, nao so cliques no link
+      SELECT
+        campaign_name,
+        SUM(clicks) * 100.0 / SUM(impressions) AS ctr_pct
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+
+  - id: 6
+    title: "NULLIF para CPA/ROAS/CTR (evitar divisao por zero)"
+    severity: critical
+    description: >
+      Campanhas pausadas, recentes ou de awareness podem ter zero conversoes,
+      zero gasto ou zero impressoes. SEMPRE use NULLIF(denominador, 0) em
+      calculos de CPA (spend / conversoes), ROAS (valor / spend), CTR
+      (cliques / impressoes) e qualquer outra divisao.
+    correct_example: |
+      -- CPA correto com NULLIF
+      SELECT
+        campaign_name,
+        ROUND(SUM(spend), 2) AS gasto,
+        ROUND(
+          SUM(spend)
+          / NULLIF(
+            SUM((SELECT COALESCE(SUM(a.value), 0) FROM UNNEST(actions) a WHERE a.action_type = 'purchase')),
+            0
+          ),
+          2
+        ) AS cpa
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+    incorrect_example: |
+      -- ERRADO: divisao por zero quando nao ha conversoes
+      SELECT
+        campaign_name,
+        SUM(spend) / SUM(...) AS cpa
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      GROUP BY campaign_name
+
+  - id: 7
+    title: "reach vs impressions — reach e usuarios unicos"
+    severity: high
+    description: >
+      `impressions` conta o total de vezes que o anuncio foi exibido (uma
+      pessoa pode ver varias vezes). `reach` conta pessoas unicas. A
+      `frequency` e impressions / reach. NAO confunda reach com impressions
+      ao medir alcance de campanha. Para dimensionar audiencia, use reach.
+      Para medir exposicao total, use impressions.
+    correct_example: |
+      -- Alcance e frequencia por campanha
+      SELECT
+        campaign_name,
+        SUM(reach) AS alcance_unico,
+        SUM(impressions) AS impressoes_totais,
+        ROUND(SUM(impressions) * 1.0 / NULLIF(SUM(reach), 0), 2) AS frequencia_media
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260131'
+      GROUP BY campaign_name
+    incorrect_example: |
+      -- ERRADO: usando impressions como se fosse alcance unico
+      SELECT
+        campaign_name,
+        SUM(impressions) AS alcance
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      GROUP BY campaign_name

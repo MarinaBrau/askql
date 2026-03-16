@@ -1,0 +1,272 @@
+source_name: meta_ads
+display_name: "Meta Ads (Facebook/Instagram)"
+description: >
+  Meta Ads data (Facebook/Instagram) exported to BigQuery via API Marketing.
+  Tables follow the standard Insights API structure used by most ETL tools
+  (Fivetran, Airbyte, scripts custom). Monetary values (spend) ja estao em
+  moeda real (NAO dividir por 1M como no Google Ads). Conversoes e valores
+  ficam nos campos ARRAY actions/action_values e requerem UNNEST.
+
+tables:
+  # ── Insights tables (metricas diarias) ──────────────────────────────────
+
+  - name: "meta_ads_insights_campaign_*"
+    description: "Metricas diarias agregadas por campanha. Cada linha = 1 campanha em 1 dia."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: date_start
+        type: STRING
+        description: "Data do registro no formato YYYY-MM-DD"
+      - name: account_id
+        type: STRING
+        description: "ID da conta de anuncios (ad account)"
+      - name: account_name
+        type: STRING
+        description: "Nome da conta de anuncios"
+      - name: campaign_id
+        type: STRING
+        description: "ID unico da campanha"
+      - name: campaign_name
+        type: STRING
+        description: "Nome da campanha definido pelo usuario"
+      - name: objective
+        type: STRING
+        description: "Objetivo da campanha: CONVERSIONS, TRAFFIC, BRAND_AWARENESS, REACH, VIDEO_VIEWS, LEAD_GENERATION, etc."
+      - name: spend
+        type: FLOAT64
+        description: "Valor gasto em moeda real (NAO esta em micros — usar diretamente)"
+      - name: impressions
+        type: INT64
+        description: "Numero total de impressoes (uma pessoa pode ver o anuncio varias vezes)"
+      - name: reach
+        type: INT64
+        description: "Numero de pessoas unicas que viram o anuncio (sempre <= impressions)"
+      - name: frequency
+        type: FLOAT64
+        description: "Numero medio de vezes que cada pessoa viu o anuncio (impressions / reach)"
+      - name: clicks
+        type: INT64
+        description: "Todos os cliques (inclui curtidas, comentarios, compartilhamentos e cliques no link)"
+      - name: link_clicks
+        type: INT64
+        description: "Apenas cliques no link do anuncio (exclui curtidas/comentarios). Usar para CTR real"
+      - name: cpc
+        type: FLOAT64
+        description: "Custo por clique (all clicks). Ja calculado pelo Meta"
+      - name: cpm
+        type: FLOAT64
+        description: "Custo por mil impressoes. Ja calculado pelo Meta"
+      - name: ctr
+        type: FLOAT64
+        description: "Click-through rate (all clicks / impressions). Ja calculado como percentual"
+      - name: actions
+        type: "ARRAY<STRUCT<action_type STRING, value FLOAT64>>"
+        description: "Conversoes por tipo de acao. Requer UNNEST para acessar. action_type = purchase, lead, link_click, page_view, etc."
+        element_fields:
+          - name: action_type
+            type: STRING
+            description: "Tipo da acao: purchase, lead, link_click, landing_page_view, page_view, add_to_cart, initiate_checkout, etc."
+          - name: value
+            type: FLOAT64
+            description: "Quantidade de acoes desse tipo (ex: 5 purchases)"
+      - name: action_values
+        type: "ARRAY<STRUCT<action_type STRING, value FLOAT64>>"
+        description: "Valor monetario por tipo de acao. Requer UNNEST para acessar. Usado para calcular ROAS"
+        element_fields:
+          - name: action_type
+            type: STRING
+            description: "Tipo da acao (mesmo namespace que actions)"
+          - name: value
+            type: FLOAT64
+            description: "Valor monetario total dessa acao (ex: R$ 1500 em purchases)"
+
+  - name: "meta_ads_insights_adset_*"
+    description: "Metricas diarias agregadas por conjunto de anuncios (ad set). Cada linha = 1 ad set em 1 dia."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: date_start
+        type: STRING
+        description: "Data do registro no formato YYYY-MM-DD"
+      - name: account_id
+        type: STRING
+        description: "ID da conta de anuncios"
+      - name: account_name
+        type: STRING
+        description: "Nome da conta de anuncios"
+      - name: campaign_id
+        type: STRING
+        description: "ID da campanha pai"
+      - name: campaign_name
+        type: STRING
+        description: "Nome da campanha pai"
+      - name: adset_id
+        type: STRING
+        description: "ID unico do conjunto de anuncios"
+      - name: adset_name
+        type: STRING
+        description: "Nome do conjunto de anuncios"
+      - name: objective
+        type: STRING
+        description: "Objetivo da campanha pai"
+      - name: spend
+        type: FLOAT64
+        description: "Valor gasto em moeda real"
+      - name: impressions
+        type: INT64
+        description: "Numero total de impressoes"
+      - name: reach
+        type: INT64
+        description: "Numero de pessoas unicas alcancadas"
+      - name: frequency
+        type: FLOAT64
+        description: "Frequencia media (impressions / reach)"
+      - name: clicks
+        type: INT64
+        description: "Todos os cliques (inclui curtidas, comentarios)"
+      - name: link_clicks
+        type: INT64
+        description: "Apenas cliques no link do anuncio"
+      - name: cpc
+        type: FLOAT64
+        description: "Custo por clique (all clicks)"
+      - name: cpm
+        type: FLOAT64
+        description: "Custo por mil impressoes"
+      - name: ctr
+        type: FLOAT64
+        description: "Click-through rate (all clicks / impressions)"
+      - name: actions
+        type: "ARRAY<STRUCT<action_type STRING, value FLOAT64>>"
+        description: "Conversoes por tipo de acao. Requer UNNEST"
+        element_fields:
+          - name: action_type
+            type: STRING
+            description: "Tipo da acao"
+          - name: value
+            type: FLOAT64
+            description: "Quantidade de acoes"
+      - name: action_values
+        type: "ARRAY<STRUCT<action_type STRING, value FLOAT64>>"
+        description: "Valor monetario por tipo de acao. Requer UNNEST"
+        element_fields:
+          - name: action_type
+            type: STRING
+            description: "Tipo da acao"
+          - name: value
+            type: FLOAT64
+            description: "Valor monetario total"
+
+  - name: "meta_ads_insights_ad_*"
+    description: "Metricas diarias por anuncio individual. Cada linha = 1 anuncio em 1 dia."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: date_start
+        type: STRING
+        description: "Data do registro no formato YYYY-MM-DD"
+      - name: account_id
+        type: STRING
+        description: "ID da conta de anuncios"
+      - name: account_name
+        type: STRING
+        description: "Nome da conta de anuncios"
+      - name: campaign_id
+        type: STRING
+        description: "ID da campanha pai"
+      - name: campaign_name
+        type: STRING
+        description: "Nome da campanha pai"
+      - name: adset_id
+        type: STRING
+        description: "ID do conjunto de anuncios pai"
+      - name: adset_name
+        type: STRING
+        description: "Nome do conjunto de anuncios pai"
+      - name: ad_id
+        type: STRING
+        description: "ID unico do anuncio"
+      - name: ad_name
+        type: STRING
+        description: "Nome do anuncio"
+      - name: objective
+        type: STRING
+        description: "Objetivo da campanha pai"
+      - name: spend
+        type: FLOAT64
+        description: "Valor gasto em moeda real"
+      - name: impressions
+        type: INT64
+        description: "Numero total de impressoes"
+      - name: reach
+        type: INT64
+        description: "Numero de pessoas unicas alcancadas"
+      - name: frequency
+        type: FLOAT64
+        description: "Frequencia media (impressions / reach)"
+      - name: clicks
+        type: INT64
+        description: "Todos os cliques (inclui curtidas, comentarios)"
+      - name: link_clicks
+        type: INT64
+        description: "Apenas cliques no link do anuncio"
+      - name: cpc
+        type: FLOAT64
+        description: "Custo por clique (all clicks)"
+      - name: cpm
+        type: FLOAT64
+        description: "Custo por mil impressoes"
+      - name: ctr
+        type: FLOAT64
+        description: "Click-through rate (all clicks / impressions)"
+      - name: actions
+        type: "ARRAY<STRUCT<action_type STRING, value FLOAT64>>"
+        description: "Conversoes por tipo de acao. Requer UNNEST"
+        element_fields:
+          - name: action_type
+            type: STRING
+            description: "Tipo da acao"
+          - name: value
+            type: FLOAT64
+            description: "Quantidade de acoes"
+      - name: action_values
+        type: "ARRAY<STRUCT<action_type STRING, value FLOAT64>>"
+        description: "Valor monetario por tipo de acao. Requer UNNEST"
+        element_fields:
+          - name: action_type
+            type: STRING
+            description: "Tipo da acao"
+          - name: value
+            type: FLOAT64
+            description: "Valor monetario total"
+
+  # ── Config table (cadastro de campanhas) ────────────────────────────────
+
+  - name: "meta_ads_campaigns"
+    description: "Cadastro de campanhas Meta Ads. Contem configuracao e status de cada campanha."
+    fields:
+      - name: id
+        type: STRING
+        description: "ID unico da campanha (mesmo valor que campaign_id nas tabelas de insights)"
+      - name: name
+        type: STRING
+        description: "Nome da campanha definido pelo usuario"
+      - name: objective
+        type: STRING
+        description: "Objetivo da campanha: CONVERSIONS, TRAFFIC, BRAND_AWARENESS, REACH, VIDEO_VIEWS, LEAD_GENERATION, etc."
+      - name: status
+        type: STRING
+        description: "Status atual: ACTIVE, PAUSED, DELETED, ARCHIVED"
+      - name: created_time
+        type: STRING
+        description: "Data/hora de criacao da campanha (formato ISO 8601)"
+      - name: updated_time
+        type: STRING
+        description: "Data/hora da ultima atualizacao"
+      - name: daily_budget
+        type: FLOAT64
+        description: "Orcamento diario em moeda real (pode ser NULL se usar lifetime_budget)"
+      - name: lifetime_budget
+        type: FLOAT64
+        description: "Orcamento total da campanha (pode ser NULL se usar daily_budget)"
+      - name: buying_type
+        type: STRING
+        description: "Tipo de compra: AUCTION (padrao) ou RESERVED"

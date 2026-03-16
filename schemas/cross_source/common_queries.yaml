@@ -1,0 +1,171 @@
+source_name: cross_source
+display_name: "Combinando Fontes — Cross-Source Templates"
+description: "Templates que combinam dados de duas fontes diferentes. Usam CTEs separadas, PARSE_DATE para alinhar datas, e normalizam unidades monetarias."
+
+templates:
+  # ============================================================
+  # GA4 + Google Ads
+  # ============================================================
+
+  - title: "Sessoes GA4 vs Gasto Google Ads por dia"
+    category: combinando_fontes
+    sources: ["ga4_bigquery", "google_ads"]
+    description: "Compara sessoes e usuarios do GA4 com investimento e cliques do Google Ads, dia a dia."
+    natural_language: "Qual a relacao entre sessoes do GA4 e gastos do Google Ads por dia?"
+    explanation: "Combina GA4 (sessoes, usuarios) com Google Ads (custo, cliques) por data. Mostra custo por sessao e sessoes por real investido."
+    sql: |
+      WITH ga4_daily AS (
+        SELECT
+          PARSE_DATE('%Y%m%d', event_date) AS data,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, '-',
+            CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+          )) AS sessoes,
+          COUNT(DISTINCT user_pseudo_id) AS usuarios
+        FROM `{project_id}.{dataset}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        GROUP BY data
+      ),
+      gads_daily AS (
+        SELECT
+          PARSE_DATE('%Y-%m-%d', segments_date) AS data,
+          SUM(metrics_cost_micros) / 1000000.0 AS custo,
+          SUM(metrics_clicks) AS cliques,
+          SUM(metrics_impressions) AS impressoes
+        FROM `{project_id}.{secondary_dataset}.ads_CampaignStats_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        GROUP BY data
+      )
+      SELECT
+        COALESCE(g.data, a.data) AS data,
+        g.sessoes,
+        g.usuarios,
+        ROUND(a.custo, 2) AS custo_google_ads,
+        a.cliques,
+        ROUND(a.custo / NULLIF(g.sessoes, 0), 2) AS custo_por_sessao,
+        ROUND(g.sessoes / NULLIF(a.custo, 0), 2) AS sessoes_por_real
+      FROM ga4_daily g
+      FULL OUTER JOIN gads_daily a ON g.data = a.data
+      ORDER BY data
+
+  - title: "Conversoes GA4 vs Custo Google Ads por campanha"
+    category: combinando_fontes
+    sources: ["ga4_bigquery", "google_ads"]
+    description: "Cruza conversoes do GA4 (via UTM campaign) com custo do Google Ads por nome de campanha."
+    natural_language: "Qual o custo por conversao real (GA4) de cada campanha do Google Ads?"
+    explanation: "Usa UTM campaign do GA4 para ligar com campaign_name do Google Ads. Depende de UTMs estarem configurados."
+    sql: |
+      WITH ga4_conversions AS (
+        SELECT
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign') AS campaign_name,
+          COUNT(*) AS conversoes_ga4
+        FROM `{project_id}.{dataset}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+          AND event_name = 'purchase'
+        GROUP BY campaign_name
+      ),
+      gads_spend AS (
+        SELECT
+          c.campaign_name,
+          SUM(s.metrics_cost_micros) / 1000000.0 AS custo
+        FROM `{project_id}.{secondary_dataset}.ads_CampaignStats_*` s
+        JOIN (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+          FROM `{project_id}.{secondary_dataset}.ads_Campaign_*`
+        ) c ON s.campaign_id = c.campaign_id AND c.rn = 1
+        WHERE s._TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        GROUP BY c.campaign_name
+      )
+      SELECT
+        COALESCE(g.campaign_name, a.campaign_name) AS campanha,
+        g.conversoes_ga4,
+        ROUND(a.custo, 2) AS custo_google_ads,
+        ROUND(a.custo / NULLIF(g.conversoes_ga4, 0), 2) AS cpa_real
+      FROM ga4_conversions g
+      FULL OUTER JOIN gads_spend a ON g.campaign_name = a.campaign_name
+      ORDER BY a.custo DESC NULLS LAST
+
+  # ============================================================
+  # GA4 + Meta Ads
+  # ============================================================
+
+  - title: "Sessoes GA4 vs Gasto Meta Ads por dia"
+    category: combinando_fontes
+    sources: ["ga4_bigquery", "meta_ads"]
+    description: "Compara sessoes do GA4 com investimento do Meta Ads dia a dia."
+    natural_language: "Compare sessoes do GA4 com investimento do Meta Ads por dia"
+    explanation: "Combina GA4 (sessoes, usuarios) com Meta Ads (spend, impressoes) por data. Spend do Meta ja esta em moeda real."
+    sql: |
+      WITH ga4_daily AS (
+        SELECT
+          PARSE_DATE('%Y%m%d', event_date) AS data,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, '-',
+            CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+          )) AS sessoes,
+          COUNT(DISTINCT user_pseudo_id) AS usuarios
+        FROM `{project_id}.{dataset}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        GROUP BY data
+      ),
+      meta_daily AS (
+        SELECT
+          PARSE_DATE('%Y-%m-%d', date_start) AS data,
+          SUM(spend) AS custo,
+          SUM(impressions) AS impressoes,
+          SUM(link_clicks) AS cliques
+        FROM `{project_id}.{secondary_dataset}.meta_ads_insights_campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        GROUP BY data
+      )
+      SELECT
+        COALESCE(g.data, m.data) AS data,
+        g.sessoes,
+        g.usuarios,
+        ROUND(m.custo, 2) AS custo_meta,
+        m.impressoes,
+        m.cliques,
+        ROUND(m.custo / NULLIF(g.sessoes, 0), 2) AS custo_por_sessao
+      FROM ga4_daily g
+      FULL OUTER JOIN meta_daily m ON g.data = m.data
+      ORDER BY data
+
+  # ============================================================
+  # Google Ads + Meta Ads
+  # ============================================================
+
+  - title: "Investimento Google Ads vs Meta Ads por dia"
+    category: combinando_fontes
+    sources: ["google_ads", "meta_ads"]
+    description: "Compara investimento diario entre Google Ads e Meta Ads lado a lado."
+    natural_language: "Compare investimento Google Ads vs Meta Ads por dia"
+    explanation: "Normaliza custo do Google Ads (micros /1M) e compara com spend do Meta Ads. Mostra total e percentual de cada canal."
+    sql: |
+      WITH gads_daily AS (
+        SELECT
+          PARSE_DATE('%Y-%m-%d', segments_date) AS data,
+          SUM(metrics_cost_micros) / 1000000.0 AS custo_google,
+          SUM(metrics_clicks) AS cliques_google,
+          SUM(metrics_impressions) AS impressoes_google
+        FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        GROUP BY data
+      ),
+      meta_daily AS (
+        SELECT
+          PARSE_DATE('%Y-%m-%d', date_start) AS data,
+          SUM(spend) AS custo_meta,
+          SUM(link_clicks) AS cliques_meta,
+          SUM(impressions) AS impressoes_meta
+        FROM `{project_id}.{secondary_dataset}.meta_ads_insights_campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        GROUP BY data
+      )
+      SELECT
+        COALESCE(g.data, m.data) AS data,
+        ROUND(g.custo_google, 2) AS custo_google_ads,
+        ROUND(m.custo_meta, 2) AS custo_meta_ads,
+        ROUND(COALESCE(g.custo_google, 0) + COALESCE(m.custo_meta, 0), 2) AS custo_total,
+        ROUND(COALESCE(g.custo_google, 0) / NULLIF(COALESCE(g.custo_google, 0) + COALESCE(m.custo_meta, 0), 0) * 100, 1) AS perc_google,
+        ROUND(COALESCE(m.custo_meta, 0) / NULLIF(COALESCE(g.custo_google, 0) + COALESCE(m.custo_meta, 0), 0) * 100, 1) AS perc_meta
+      FROM gads_daily g
+      FULL OUTER JOIN meta_daily m ON g.data = m.data
+      ORDER BY data

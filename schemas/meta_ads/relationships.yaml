@@ -1,0 +1,65 @@
+source_name: meta_ads
+description: >
+  Relacionamentos entre tabelas Insights (metricas) e Config (campaigns) do
+  Meta Ads. A tabela meta_ads_campaigns NAO e sharded (nao tem *), entao
+  NAO precisa de deduplicacao com ROW_NUMBER.
+
+relationships:
+  - name: "insights_campaign_to_campaigns"
+    from_table: "meta_ads_insights_campaign_*"
+    to_table: "meta_ads_campaigns"
+    join_key: "campaign_id"
+    join_key_to: "id"
+    cardinality: "N:1"
+    requires_dedup: false
+    useful_fields: [status, created_time, daily_budget, lifetime_budget, buying_type]
+    gotcha: "meta_ads_campaigns.id maps to campaign_id in insights tables. No dedup needed — single config table without sharding"
+    example_sql: |
+      SELECT
+        i.campaign_name,
+        c.status,
+        SUM(i.spend) AS investimento
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*` i
+      JOIN `{project_id}.{dataset}.meta_ads_campaigns` c ON i.campaign_id = c.id
+      WHERE i._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY i.campaign_name, c.status
+
+  - name: "insights_adset_to_campaigns"
+    from_table: "meta_ads_insights_adset_*"
+    to_table: "meta_ads_campaigns"
+    join_key: "campaign_id"
+    join_key_to: "id"
+    cardinality: "N:1"
+    requires_dedup: false
+    useful_fields: [status, created_time, daily_budget, lifetime_budget, buying_type]
+    gotcha: "meta_ads_campaigns.id maps to campaign_id in insights tables. No dedup needed"
+    example_sql: |
+      SELECT
+        i.campaign_name,
+        c.status,
+        i.adset_name,
+        SUM(i.spend) AS investimento
+      FROM `{project_id}.{dataset}.meta_ads_insights_adset_*` i
+      JOIN `{project_id}.{dataset}.meta_ads_campaigns` c ON i.campaign_id = c.id
+      WHERE i._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY i.campaign_name, c.status, i.adset_name
+
+  - name: "insights_ad_to_campaigns"
+    from_table: "meta_ads_insights_ad_*"
+    to_table: "meta_ads_campaigns"
+    join_key: "campaign_id"
+    join_key_to: "id"
+    cardinality: "N:1"
+    requires_dedup: false
+    useful_fields: [status, created_time, daily_budget, lifetime_budget, buying_type]
+    gotcha: "meta_ads_campaigns.id maps to campaign_id in insights tables. No dedup needed"
+    example_sql: |
+      SELECT
+        i.campaign_name,
+        c.status,
+        i.ad_name,
+        SUM(i.spend) AS investimento
+      FROM `{project_id}.{dataset}.meta_ads_insights_ad_*` i
+      JOIN `{project_id}.{dataset}.meta_ads_campaigns` c ON i.campaign_id = c.id
+      WHERE i._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY i.campaign_name, c.status, i.ad_name

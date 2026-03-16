@@ -1,0 +1,218 @@
+source_name: google_ads
+description: >
+  Gotchas criticos para gerar SQL correto sobre tabelas do Google Ads
+  exportadas via BigQuery Data Transfer Service.
+
+gotchas:
+  - id: 1
+    title: "cost_micros deve ser dividido por 1.000.000"
+    severity: critical
+    description: >
+      Todos os campos monetarios no Google Ads Data Transfer sao armazenados
+      em micros (1 unidade de moeda = 1.000.000 micros). Isso inclui
+      metrics_cost_micros, metrics_average_cpc e campaign_budget_amount_micros.
+      Se voce NAO dividir, os valores aparecerao 1 milhao de vezes maiores
+      que o real — um erro catastrofico em relatorios de investimento.
+    correct_example: |
+      -- Custo real em moeda
+      SELECT
+        segments_date,
+        SUM(metrics_cost_micros) / 1000000.0 AS custo_reais
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY segments_date
+      ORDER BY segments_date
+    incorrect_example: |
+      -- ERRADO: valor em micros sem conversao (1M vezes maior!)
+      SELECT
+        segments_date,
+        SUM(metrics_cost_micros) AS custo
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY segments_date
+
+  - id: 2
+    title: "Usar _TABLE_SUFFIX para filtrar datas nas tabelas wildcard"
+    severity: critical
+    description: >
+      As tabelas do Google Ads Data Transfer usam sharding por data no formato
+      ads_TableName_YYYYMMDD. Para filtrar por periodo, use _TABLE_SUFFIX
+      com formato YYYYMMDD (string sem hifens). Isso e essencial para performance
+      e controle de custo — sem esse filtro, o BigQuery escaneia TODAS as particoes.
+    correct_example: |
+      -- Filtro correto usando _TABLE_SUFFIX (formato YYYYMMDD)
+      SELECT *
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+    incorrect_example: |
+      -- ERRADO: sem _TABLE_SUFFIX — escaneia TODAS as particoes (custo alto!)
+      SELECT *
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE segments_date BETWEEN '2025-01-01' AND '2025-01-31'
+
+      -- ERRADO: formato com hifens no _TABLE_SUFFIX
+      SELECT *
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '2025-01-01' AND '2025-01-31'
+
+  - id: 3
+    title: "segments_date e o campo de data do registro (YYYY-MM-DD)"
+    severity: high
+    description: >
+      O campo segments_date contem a data do dado no formato STRING YYYY-MM-DD.
+      Use este campo para agrupar por data, semana, mes, etc. Note que o formato
+      e diferente de _TABLE_SUFFIX (YYYYMMDD sem hifens). Ambos devem ser usados
+      juntos: _TABLE_SUFFIX para filtrar particoes (performance) e segments_date
+      para logica de negocio (agrupamentos, formatacao).
+    correct_example: |
+      -- Usar _TABLE_SUFFIX para filtro de particao E segments_date para agrupamento
+      SELECT
+        segments_date,
+        SUM(metrics_cost_micros) / 1000000.0 AS custo,
+        SUM(metrics_clicks) AS cliques
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY segments_date
+      ORDER BY segments_date
+    incorrect_example: |
+      -- ERRADO: usando _TABLE_SUFFIX como campo de agrupamento
+      SELECT
+        _TABLE_SUFFIX AS data,
+        SUM(metrics_clicks) AS cliques
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      GROUP BY _TABLE_SUFFIX
+
+  - id: 4
+    title: "CPA: usar NULLIF para evitar divisao por zero"
+    severity: critical
+    description: >
+      O calculo de CPA (Custo por Aquisicao) e custo / conversoes.
+      Campanhas sem conversoes resultam em divisao por zero. SEMPRE use
+      NULLIF(SUM(metrics_conversions), 0) no denominador. O mesmo vale
+      para CPL, CPC manual e qualquer metrica que divida por quantidade.
+    correct_example: |
+      -- CPA correto com NULLIF
+      SELECT
+        campaign_id,
+        SUM(metrics_cost_micros) / 1000000.0
+          / NULLIF(SUM(metrics_conversions), 0) AS cpa
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY campaign_id
+    incorrect_example: |
+      -- ERRADO: divisao por zero quando nao ha conversoes
+      SELECT
+        campaign_id,
+        SUM(metrics_cost_micros) / 1000000.0
+          / SUM(metrics_conversions) AS cpa
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY campaign_id
+
+  - id: 5
+    title: "ROAS: usar NULLIF no denominador (custo)"
+    severity: critical
+    description: >
+      O calculo de ROAS (Return on Ad Spend) e valor_conversoes / custo.
+      Se o custo for zero (campanha pausada, por exemplo), ocorre divisao
+      por zero. SEMPRE use NULLIF no denominador. Lembre-se tambem de
+      converter cost_micros antes de calcular.
+    correct_example: |
+      -- ROAS correto com conversao de micros e NULLIF
+      SELECT
+        campaign_id,
+        SUM(metrics_conversions_value)
+          / NULLIF(SUM(metrics_cost_micros) / 1000000.0, 0) AS roas
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY campaign_id
+    incorrect_example: |
+      -- ERRADO: sem NULLIF e sem converter micros
+      SELECT
+        campaign_id,
+        SUM(metrics_conversions_value)
+          / SUM(metrics_cost_micros) AS roas
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY campaign_id
+
+  - id: 6
+    title: "JOIN stats com config tables usando campaign_id / ad_group_id"
+    severity: high
+    description: >
+      Para obter nomes de campanhas ou ad groups, faca JOIN entre tabelas
+      de stats (CampaignStats, AdGroupStats, etc.) e tabelas de config
+      (Campaign, AdGroup). Use campaign_id e/ou ad_group_id como chave.
+      As tabelas de config devem ser deduplicadas ANTES do JOIN (ver gotcha 7).
+    correct_example: |
+      -- JOIN correto: stats com config (campanha deduplicada)
+      WITH campaigns AS (
+        SELECT
+          campaign_id,
+          campaign_name,
+          campaign_advertising_channel_type,
+          ROW_NUMBER() OVER (
+            PARTITION BY campaign_id
+            ORDER BY _TABLE_SUFFIX DESC
+          ) AS rn
+        FROM `{project_id}.{dataset}.ads_Campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      )
+      SELECT
+        c.campaign_name,
+        c.campaign_advertising_channel_type,
+        SUM(s.metrics_cost_micros) / 1000000.0 AS custo,
+        SUM(s.metrics_clicks) AS cliques
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*` s
+      JOIN campaigns c
+        ON s.campaign_id = c.campaign_id AND c.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '20250101' AND '20250131'
+      GROUP BY c.campaign_name, c.campaign_advertising_channel_type
+    incorrect_example: |
+      -- ERRADO: JOIN direto sem deduplicar — causa inflacao de valores!
+      SELECT
+        c.campaign_name,
+        SUM(s.metrics_cost_micros) / 1000000.0 AS custo
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*` s
+      JOIN `{project_id}.{dataset}.ads_Campaign_*` c
+        ON s.campaign_id = c.campaign_id
+      GROUP BY c.campaign_name
+
+  - id: 7
+    title: "Config tables tem multiplos _DATA_DATE — deduplicar com ROW_NUMBER"
+    severity: critical
+    description: >
+      As tabelas de configuracao (ads_Campaign_*, ads_AdGroup_*) recebem
+      um snapshot por dia via Data Transfer. Isso significa que a mesma
+      campanha aparece em multiplas particoes (_TABLE_SUFFIX). Se voce fizer
+      JOIN diretamente, cada linha de stats sera multiplicada pelo numero
+      de snapshots, inflando metricas em 2x, 3x ou mais. SEMPRE deduplicar
+      com ROW_NUMBER() OVER (PARTITION BY id ORDER BY _TABLE_SUFFIX DESC)
+      e filtrar rn = 1 para pegar o snapshot mais recente.
+    correct_example: |
+      -- Deduplicar config table com ROW_NUMBER
+      WITH campaigns_dedup AS (
+        SELECT
+          campaign_id,
+          campaign_name,
+          campaign_status,
+          campaign_advertising_channel_type,
+          campaign_bidding_strategy_type,
+          campaign_budget_amount_micros / 1000000.0 AS budget_diario,
+          ROW_NUMBER() OVER (
+            PARTITION BY campaign_id
+            ORDER BY _TABLE_SUFFIX DESC
+          ) AS rn
+        FROM `{project_id}.{dataset}.ads_Campaign_*`
+      )
+      SELECT *
+      FROM campaigns_dedup
+      WHERE rn = 1
+    incorrect_example: |
+      -- ERRADO: query na config table sem deduplicar
+      -- Retorna N linhas por campanha (1 por dia de snapshot)
+      SELECT
+        campaign_id,
+        campaign_name,
+        campaign_status
+      FROM `{project_id}.{dataset}.ads_Campaign_*`

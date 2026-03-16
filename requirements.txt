@@ -1,0 +1,7 @@
+streamlit==1.41.1
+anthropic==0.49.0
+google-cloud-bigquery==3.27.0
+db-dtypes==1.5.0
+pyyaml==6.0.2
+sqlparse==0.5.3
+python-dotenv==1.0.1

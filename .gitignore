@@ -1,0 +1,8 @@
+.env
+credentials/
+__pycache__/
+*.pyc
+.venv/
+validation/results/*.json
+validation/results/*.md
+!validation/results/.gitkeep

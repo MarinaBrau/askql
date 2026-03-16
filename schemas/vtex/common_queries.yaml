@@ -1,0 +1,219 @@
+source_name: vtex
+display_name: "VTEX — Common Queries"
+description: "Templates de consultas frequentes para dados de e-commerce VTEX no BigQuery (dataset vtex_treated)."
+
+templates:
+  # ============================================================
+  # VENDAS — Receita e performance de pedidos
+  # ============================================================
+
+  - title: "Receita por Dia"
+    category: vendas
+    description: "Evolucao diaria de receita, pedidos e ticket medio para pedidos faturados."
+    natural_language: "Qual foi a receita por dia?"
+    sql: |
+      -- Receita diaria de pedidos faturados — VTEX
+      -- Precos ja em reais, filtrar por dt para partition pruning
+      SELECT
+        dt AS data,
+        COUNT(DISTINCT order_id) AS pedidos,
+        ROUND(SUM(total_value), 2) AS receita,
+        ROUND(AVG(total_value), 2) AS ticket_medio,
+        ROUND(SUM(shipping_price), 2) AS frete_total
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+        AND status = 'invoiced'
+      GROUP BY dt
+      ORDER BY dt
+    explanation: >
+      Esta consulta mostra a evolucao diaria de receita para pedidos com status
+      'invoiced' (faturados). Para cada dia, exibe a quantidade de pedidos, receita
+      total em reais, ticket medio e valor de frete. Os precos ja estao em reais
+      (o pipeline converteu centavos para reais). Util para identificar tendencias
+      de vendas e picos de faturamento ao longo do periodo.
+
+  - title: "Top 10 Produtos Mais Vendidos"
+    category: vendas
+    description: "Ranking dos produtos com maior receita, com unidades vendidas e ticket medio por produto."
+    natural_language: "Quais sao os 10 produtos mais vendidos?"
+    sql: |
+      -- Top 10 produtos por receita — VTEX (JOIN orders + order_items)
+      -- Precos ja em reais — NAO dividir por 100
+      SELECT
+        i.name AS produto,
+        i.brand_name AS marca,
+        SUM(i.quantity) AS unidades_vendidas,
+        COUNT(DISTINCT i.order_id) AS pedidos_com_produto,
+        ROUND(SUM(i.total), 2) AS receita_produto,
+        ROUND(AVG(i.selling_price), 2) AS preco_medio_venda
+      FROM `{project_id}.{dataset}.order_items_treated` i
+      JOIN `{project_id}.{dataset}.orders_treated` o ON i.order_id = o.order_id
+      WHERE i.dt BETWEEN '{date_start}' AND '{date_end}'
+        AND o.dt BETWEEN '{date_start}' AND '{date_end}'
+        AND o.status = 'invoiced'
+      GROUP BY i.name, i.brand_name
+      ORDER BY receita_produto DESC
+      LIMIT 10
+    explanation: >
+      Esta consulta lista os 10 produtos que geraram mais receita no periodo.
+      O JOIN entre order_items_treated e orders_treated garante que apenas pedidos
+      faturados sejam considerados. Para cada produto, mostra o nome, marca, total
+      de unidades vendidas, numero de pedidos distintos que incluiram o produto,
+      receita total e preco medio de venda. Util para identificar os produtos
+      mais populares e campeoes de receita.
+
+  - title: "Ticket Medio e Performance por Status"
+    category: vendas
+    description: "Distribuicao de pedidos por status com receita e ticket medio — util para analisar cancelamentos."
+    natural_language: "Qual o ticket medio e quantos pedidos estao em cada status?"
+    sql: |
+      -- Performance de pedidos por status — VTEX
+      -- Inclui todos os status para visibilidade de cancelamentos
+      SELECT
+        status,
+        COUNT(DISTINCT order_id) AS total_pedidos,
+        ROUND(SUM(total_value), 2) AS receita_total,
+        ROUND(AVG(total_value), 2) AS ticket_medio,
+        ROUND(SUM(total_value) * 100.0 / SUM(SUM(total_value)) OVER (), 1) AS pct_receita
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY status
+      ORDER BY total_pedidos DESC
+    explanation: >
+      Esta consulta mostra a distribuicao de pedidos por status para o periodo
+      selecionado. Para cada status (invoiced, canceled, payment-approved, etc.),
+      exibe a quantidade de pedidos, receita total, ticket medio e o percentual
+      da receita total que cada status representa. Util para entender a taxa de
+      cancelamento, pedidos em aberto e o volume faturado versus o total criado.
+
+  # ============================================================
+  # MARKETING — UTMs e canais
+  # ============================================================
+
+  - title: "Receita e Pedidos por Canal (UTM Source)"
+    category: marketing
+    description: "Analise de canais de aquisicao por utm_source — mostra de onde vem os pedidos e a receita."
+    natural_language: "Quais canais de marketing geram mais receita?"
+    sql: |
+      -- Receita por canal de aquisicao (utm_source) — VTEX
+      -- NULL = pedido sem UTM (direto, digitado, app, etc.)
+      SELECT
+        COALESCE(utm_source, '(sem UTM)') AS canal,
+        COUNT(DISTINCT order_id) AS pedidos,
+        ROUND(SUM(total_value), 2) AS receita,
+        ROUND(AVG(total_value), 2) AS ticket_medio,
+        ROUND(SUM(total_value) * 100.0 / SUM(SUM(total_value)) OVER (), 1) AS pct_receita
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+        AND status = 'invoiced'
+      GROUP BY utm_source
+      ORDER BY receita DESC
+    explanation: >
+      Esta consulta mostra quais canais de marketing (utm_source) geraram mais
+      receita e pedidos no periodo. Pedidos sem UTM aparecem como '(sem UTM)' —
+      geralmente representam acesso direto, trafego organico sem rastreamento ou
+      compras pelo app. Para cada canal, mostra pedidos, receita total, ticket
+      medio e participacao percentual na receita total. Util para avaliar o
+      retorno de cada canal de midia paga e organico.
+
+  - title: "Analise de Cupons — Efetividade"
+    category: marketing
+    description: "Pedidos, receita e ticket medio por cupom, com status do cupom — para avaliar campanhas de desconto."
+    natural_language: "Quais cupons foram mais usados e geraram mais receita?"
+    sql: |
+      -- Analise de cupons: efetividade por codigo — VTEX
+      -- LEFT JOIN para incluir todos os pedidos com cupom, mesmo sem match em coupons_treated
+      SELECT
+        o.coupon_code,
+        COALESCE(cp.utm_campaign, '(sem campanha)') AS campanha_cupom,
+        COALESCE(cp.coupon_status, 'desconhecido') AS status_cupom,
+        COUNT(DISTINCT o.order_id) AS pedidos_com_cupom,
+        ROUND(SUM(o.total_value), 2) AS receita_com_cupom,
+        ROUND(AVG(o.total_value), 2) AS ticket_medio,
+        -- Desconto medio: diferenca entre preco de tabela e preco pago
+        ROUND(AVG(o.total_value - o.shipping_price), 2) AS valor_medio_sem_frete
+      FROM `{project_id}.{dataset}.orders_treated` o
+      LEFT JOIN `{project_id}.{dataset}.coupons_treated` cp
+        ON o.coupon_code = cp.coupon_code
+        AND cp.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.coupons_treated`)
+      WHERE o.dt BETWEEN '{date_start}' AND '{date_end}'
+        AND o.status = 'invoiced'
+        AND o.coupon_code IS NOT NULL
+      GROUP BY o.coupon_code, cp.utm_campaign, cp.coupon_status
+      ORDER BY pedidos_com_cupom DESC
+    explanation: >
+      Esta consulta analisa a efetividade dos cupons de desconto no periodo.
+      Para cada codigo de cupom utilizado em pedidos faturados, mostra a campanha
+      associada, o status do cupom (active, expired, used), quantos pedidos usaram
+      o cupom, a receita total gerada e o ticket medio. Pedidos sem match no
+      cadastro de cupons aparecem com status 'desconhecido'. Util para avaliar
+      quais campanhas de desconto performaram melhor e qual o impacto dos cupons
+      na receita.
+
+  # ============================================================
+  # LOGISTICA — Frete e entrega
+  # ============================================================
+
+  - title: "Custo de Frete por Transportadora"
+    category: logistica
+    description: "Volume de pedidos, receita de frete e frete medio por transportadora para analise logistica."
+    natural_language: "Qual o custo de frete por transportadora?"
+    sql: |
+      -- Analise de frete por transportadora — VTEX
+      -- shipping_price ja em reais (NAO dividir por 100)
+      SELECT
+        COALESCE(delivery_company, '(nao informado)') AS transportadora,
+        COUNT(DISTINCT order_id) AS total_pedidos,
+        ROUND(SUM(shipping_price), 2) AS receita_frete,
+        ROUND(AVG(shipping_price), 2) AS frete_medio,
+        -- Percentual de pedidos com frete gratis
+        ROUND(
+          SUM(CASE WHEN shipping_price = 0 THEN 1 ELSE 0 END) * 100.0
+          / NULLIF(COUNT(*), 0),
+          1
+        ) AS pct_frete_gratis
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+        AND status = 'invoiced'
+      GROUP BY delivery_company
+      ORDER BY total_pedidos DESC
+    explanation: >
+      Esta consulta analisa o desempenho das transportadoras no periodo. Para cada
+      empresa de entrega, mostra o total de pedidos, a receita de frete (valor pago
+      pelo cliente), o frete medio e o percentual de pedidos com frete gratis.
+      Os valores de frete ja estao em reais. Util para entender a distribuicao
+      entre transportadoras e avaliar o impacto das politicas de frete gratis.
+
+  # ============================================================
+  # CATALOGO — Produtos e margem
+  # ============================================================
+
+  - title: "Margem de Produtos por Categoria"
+    category: catalogo
+    description: "Analise de markup percentual por categoria de produto — para otimizacao de precificacao."
+    natural_language: "Qual a margem de markup dos produtos por categoria?"
+    sql: |
+      -- Markup por categoria de produto — VTEX
+      -- price_markup_pct ja calculado pelo pipeline: (base_price - cost_price) / cost_price * 100
+      SELECT
+        cat.name AS categoria,
+        cat.level AS nivel_hierarquico,
+        COUNT(DISTINCT c.product_id) AS total_produtos,
+        COUNT(DISTINCT CASE WHEN c.has_stock THEN c.product_id END) AS produtos_em_estoque,
+        ROUND(AVG(c.price_markup_pct), 1) AS markup_medio_pct,
+        ROUND(MIN(c.price_markup_pct), 1) AS markup_minimo_pct,
+        ROUND(MAX(c.price_markup_pct), 1) AS markup_maximo_pct,
+        ROUND(AVG(c.base_price), 2) AS preco_medio_reais
+      FROM `{project_id}.{dataset}.catalog_treated` c
+      JOIN `{project_id}.{dataset}.categories_treated` cat ON c.category_id = cat.category_id
+      WHERE c.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.catalog_treated`)
+        AND cat.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.categories_treated`)
+      GROUP BY cat.name, cat.level
+      ORDER BY markup_medio_pct DESC
+    explanation: >
+      Esta consulta analisa o markup percentual dos produtos agrupados por categoria.
+      O markup e calculado pelo pipeline como (preco_base - custo) / custo * 100.
+      Para cada categoria, mostra o total de produtos, quantos tem estoque disponivel,
+      o markup medio, minimo e maximo, e o preco medio de venda em reais. Os dados
+      refletem o estado mais recente do catalogo. Util para identificar categorias
+      com margem alta ou baixa e otimizar a politica de precificacao.

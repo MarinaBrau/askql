@@ -1,0 +1,406 @@
+source_name: ga4_bigquery
+display_name: "GA4 BigQuery Export"
+description: "Google Analytics 4 raw data exported to BigQuery. Each row represents a single event collected by the GA4 property. Tables are sharded by day (events_YYYYMMDD)."
+
+tables:
+  - name: "events_*"
+    description: "Tabela principal de eventos do GA4, particionada por dia. Cada linha representa um evento coletado (page_view, session_start, purchase, etc.). Nome real segue o padrao events_YYYYMMDD (ex: events_20260215)."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      # --- Top-level scalar fields ---
+      - name: event_date
+        type: STRING
+        description: "Data do evento no formato YYYYMMDD. ATENCAO: para filtrar datas, usar _TABLE_SUFFIX ao inves deste campo para evitar full table scan."
+
+      - name: event_timestamp
+        type: INTEGER
+        description: "Timestamp do evento em microsegundos (Unix epoch). Dividir por 1000000 para obter segundos Unix. Usar TIMESTAMP_MICROS() para converter em TIMESTAMP."
+
+      - name: event_name
+        type: STRING
+        description: "Nome do evento. Valores comuns: page_view, session_start, first_visit, scroll, click, view_item, add_to_cart, begin_checkout, purchase, user_engagement, file_download, video_start, video_progress, video_complete."
+
+      - name: event_previous_timestamp
+        type: INTEGER
+        description: "Timestamp do evento anterior do mesmo usuario, em microsegundos. Pode ser NULL se nao houver evento anterior."
+
+      - name: event_value_in_usd
+        type: FLOAT
+        description: "Valor monetario do evento convertido para USD pelo GA4. Presente em eventos de conversao como purchase."
+
+      - name: event_bundle_sequence_id
+        type: INTEGER
+        description: "ID sequencial do bundle de eventos. Usado internamente pelo GA4 para agrupar eventos enviados juntos."
+
+      - name: event_server_timestamp_offset
+        type: INTEGER
+        description: "Diferenca em microsegundos entre o timestamp do evento no cliente e no servidor. Util para detectar discrepancias de horario."
+
+      - name: user_id
+        type: STRING
+        description: "ID de usuario definido pelo desenvolvedor (setUserId). Pode ser NULL se nao configurado. Representa o ID do usuario no sistema do cliente."
+
+      - name: user_pseudo_id
+        type: STRING
+        description: "Identificador pseudonimo do usuario (baseado em cookie/device). Sempre presente. Combinado com ga_session_id (de event_params) forma a chave unica de sessao."
+
+      - name: user_first_touch_timestamp
+        type: INTEGER
+        description: "Timestamp em microsegundos da primeira vez que o usuario interagiu com o app/site. Util para calcular lifetime e cohorts."
+
+      - name: privacy_info
+        type: STRUCT
+        description: "Informacoes sobre consentimento de privacidade do usuario."
+        sub_fields:
+          - name: analytics_storage
+            type: STRING
+            description: "Status do consentimento de analytics storage (Yes, No, Not set)."
+          - name: ads_storage
+            type: STRING
+            description: "Status do consentimento de ads storage (Yes, No, Not set)."
+          - name: uses_transient_token
+            type: STRING
+            description: "Se o usuario usa token transitorio ao inves de cookies."
+
+      # --- event_params (ARRAY) ---
+      - name: event_params
+        type: ARRAY
+        description: "Parametros do evento. REQUER UNNEST para acessar. Cada evento tem parametros diferentes. Parametros comuns: page_location, page_title, page_referrer, ga_session_id, ga_session_number, engagement_time_msec, source, medium, campaign, term, content, entrances, session_engaged, value."
+        element_type: STRUCT
+        element_fields:
+          - name: key
+            type: STRING
+            description: "Nome do parametro (ex: page_location, ga_session_id, source, medium, campaign, value, engagement_time_msec)."
+          - name: value
+            type: STRUCT
+            description: "Valor do parametro. Apenas UM dos sub-campos tera valor, dependendo do tipo do parametro."
+            sub_fields:
+              - name: string_value
+                type: STRING
+                description: "Valor quando o parametro e string (ex: page_location, source, medium, campaign, page_title)."
+              - name: int_value
+                type: INTEGER
+                description: "Valor quando o parametro e inteiro (ex: ga_session_id, ga_session_number, engagement_time_msec, entrances, session_engaged)."
+              - name: float_value
+                type: FLOAT
+                description: "Valor quando o parametro e float (ex: value em eventos de conversao)."
+              - name: double_value
+                type: FLOAT
+                description: "Valor quando o parametro e double precision. Raramente usado; preferir float_value."
+
+      # --- user_properties (ARRAY) ---
+      - name: user_properties
+        type: ARRAY
+        description: "Propriedades do usuario definidas via setUserProperty. REQUER UNNEST para acessar. Similar a event_params em estrutura."
+        element_type: STRUCT
+        element_fields:
+          - name: key
+            type: STRING
+            description: "Nome da propriedade do usuario (ex: user_type, membership_level, ltv_tier)."
+          - name: value
+            type: STRUCT
+            description: "Valor da propriedade. Apenas UM dos sub-campos tera valor."
+            sub_fields:
+              - name: string_value
+                type: STRING
+                description: "Valor string da propriedade."
+              - name: int_value
+                type: INTEGER
+                description: "Valor inteiro da propriedade."
+              - name: float_value
+                type: FLOAT
+                description: "Valor float da propriedade."
+              - name: double_value
+                type: FLOAT
+                description: "Valor double da propriedade."
+              - name: set_timestamp_micros
+                type: INTEGER
+                description: "Timestamp em microsegundos de quando a propriedade foi definida/atualizada."
+
+      # --- device (STRUCT) ---
+      - name: device
+        type: STRUCT
+        description: "Informacoes sobre o dispositivo do usuario no momento do evento."
+        sub_fields:
+          - name: category
+            type: STRING
+            description: "Categoria do dispositivo: desktop, mobile, tablet."
+          - name: mobile_brand_name
+            type: STRING
+            description: "Marca do dispositivo movel (ex: Apple, Samsung, Motorola). NULL para desktop."
+          - name: mobile_model_name
+            type: STRING
+            description: "Modelo do dispositivo movel (ex: iPhone 14, Galaxy S23). NULL para desktop."
+          - name: mobile_marketing_name
+            type: STRING
+            description: "Nome comercial do dispositivo movel."
+          - name: mobile_os_hardware_model
+            type: STRING
+            description: "Modelo de hardware do sistema operacional movel."
+          - name: operating_system
+            type: STRING
+            description: "Sistema operacional (ex: Android, iOS, Windows, Macintosh, Linux, Chrome OS)."
+          - name: operating_system_version
+            type: STRING
+            description: "Versao do sistema operacional (ex: 17.2, 14, 10)."
+          - name: vendor_id
+            type: STRING
+            description: "IDFV (Identifier for Vendor) em iOS. NULL para outras plataformas."
+          - name: advertising_id
+            type: STRING
+            description: "ID de publicidade (IDFA/GAID). Pode ser NULL se usuario nao consentiu."
+          - name: language
+            type: STRING
+            description: "Idioma configurado no dispositivo (ex: pt-br, en-us, es)."
+          - name: is_limited_ad_tracking
+            type: STRING
+            description: "Se o rastreamento de anuncios esta limitado (Yes, No)."
+          - name: time_zone_offset_seconds
+            type: INTEGER
+            description: "Offset do fuso horario do dispositivo em segundos em relacao ao GMT."
+          - name: browser
+            type: STRING
+            description: "Navegador usado (ex: Chrome, Safari, Firefox, Edge, Samsung Internet). Presente apenas para platform = web."
+          - name: browser_version
+            type: STRING
+            description: "Versao do navegador."
+          - name: web_info
+            type: STRUCT
+            description: "Informacoes especificas de web."
+            sub_fields:
+              - name: browser
+                type: STRING
+                description: "Navegador (duplicado do device.browser)."
+              - name: browser_version
+                type: STRING
+                description: "Versao do navegador."
+              - name: hostname
+                type: STRING
+                description: "Hostname do site (ex: www.example.com)."
+
+      # --- geo (STRUCT) ---
+      - name: geo
+        type: STRUCT
+        description: "Informacoes geograficas do usuario baseadas no IP."
+        sub_fields:
+          - name: continent
+            type: STRING
+            description: "Continente (ex: Americas, Europe, Asia)."
+          - name: country
+            type: STRING
+            description: "Pais (ex: Brazil, United States, Portugal)."
+          - name: region
+            type: STRING
+            description: "Estado/regiao (ex: Sao Paulo, Distrito Federal, California)."
+          - name: city
+            type: STRING
+            description: "Cidade (ex: Sao Paulo, Brasilia, Rio de Janeiro)."
+          - name: sub_continent
+            type: STRING
+            description: "Sub-continente (ex: South America, Northern Europe)."
+          - name: metro
+            type: STRING
+            description: "Area metropolitana / DMA (Designated Market Area). Mais comum nos EUA."
+
+      # --- traffic_source (STRUCT) ---
+      - name: traffic_source
+        type: STRUCT
+        description: "Fonte de trafego da PRIMEIRA sessao do usuario (atribuicao de primeira interacao). Para atribuicao da sessao atual, usar collected_traffic_source ou event_params (source, medium, campaign)."
+        sub_fields:
+          - name: source
+            type: STRING
+            description: "Fonte de trafego da primeira visita (ex: google, facebook, direct, newsletter)."
+          - name: medium
+            type: STRING
+            description: "Meio de trafego da primeira visita (ex: organic, cpc, referral, email, social)."
+          - name: name
+            type: STRING
+            description: "Nome da campanha da primeira visita."
+
+      # --- collected_traffic_source (STRUCT) ---
+      - name: collected_traffic_source
+        type: STRUCT
+        description: "Fonte de trafego coletada no momento do evento. Contem dados mais detalhados que traffic_source, incluindo parametros UTM e gclid. Disponivel a partir do GA4 com export recente."
+        sub_fields:
+          - name: manual_campaign_id
+            type: STRING
+            description: "ID da campanha manual (utm_id)."
+          - name: manual_campaign_name
+            type: STRING
+            description: "Nome da campanha manual (utm_campaign)."
+          - name: manual_source
+            type: STRING
+            description: "Fonte manual (utm_source)."
+          - name: manual_medium
+            type: STRING
+            description: "Meio manual (utm_medium)."
+          - name: manual_term
+            type: STRING
+            description: "Termo manual (utm_term)."
+          - name: manual_content
+            type: STRING
+            description: "Conteudo manual (utm_content)."
+          - name: gclid
+            type: STRING
+            description: "Google Click ID. Presente quando o usuario veio de um anuncio Google Ads."
+          - name: dclid
+            type: STRING
+            description: "Display Click ID (DoubleClick). Presente quando o usuario veio de um anuncio Display & Video 360."
+          - name: srsltid
+            type: STRING
+            description: "ID do Google Merchant Center / Shopping."
+
+      # --- items (ARRAY) ---
+      - name: items
+        type: ARRAY
+        description: "Itens de e-commerce associados ao evento. REQUER CROSS JOIN UNNEST(items) AS item para acessar. Presente em eventos como view_item, add_to_cart, begin_checkout, purchase. Pode ter multiplos itens por evento."
+        element_type: STRUCT
+        element_fields:
+          - name: item_id
+            type: STRING
+            description: "ID unico do item/produto (SKU)."
+          - name: item_name
+            type: STRING
+            description: "Nome do item/produto."
+          - name: item_brand
+            type: STRING
+            description: "Marca do item/produto."
+          - name: item_variant
+            type: STRING
+            description: "Variante do item (ex: cor, tamanho)."
+          - name: item_category
+            type: STRING
+            description: "Categoria principal do item (nivel 1)."
+          - name: item_category2
+            type: STRING
+            description: "Categoria nivel 2 do item."
+          - name: item_category3
+            type: STRING
+            description: "Categoria nivel 3 do item."
+          - name: item_category4
+            type: STRING
+            description: "Categoria nivel 4 do item."
+          - name: item_category5
+            type: STRING
+            description: "Categoria nivel 5 do item."
+          - name: price_in_usd
+            type: FLOAT
+            description: "Preco do item convertido para USD."
+          - name: price
+            type: FLOAT
+            description: "Preco do item na moeda local."
+          - name: quantity
+            type: INTEGER
+            description: "Quantidade do item no evento."
+          - name: item_revenue_in_usd
+            type: FLOAT
+            description: "Receita do item convertida para USD."
+          - name: item_revenue
+            type: FLOAT
+            description: "Receita do item na moeda local."
+          - name: item_refund_in_usd
+            type: FLOAT
+            description: "Valor de reembolso do item em USD."
+          - name: item_refund
+            type: FLOAT
+            description: "Valor de reembolso do item na moeda local."
+          - name: coupon
+            type: STRING
+            description: "Cupom aplicado ao item."
+          - name: affiliation
+            type: STRING
+            description: "Afiliacao do item (ex: loja parceira)."
+          - name: location_id
+            type: STRING
+            description: "ID de localizacao associado ao item."
+          - name: item_list_id
+            type: STRING
+            description: "ID da lista onde o item foi exibido."
+          - name: item_list_name
+            type: STRING
+            description: "Nome da lista onde o item foi exibido."
+          - name: item_list_index
+            type: STRING
+            description: "Posicao do item na lista."
+          - name: promotion_id
+            type: STRING
+            description: "ID da promocao associada ao item."
+          - name: promotion_name
+            type: STRING
+            description: "Nome da promocao associada ao item."
+          - name: creative_name
+            type: STRING
+            description: "Nome do criativo da promocao."
+          - name: creative_slot
+            type: STRING
+            description: "Slot do criativo da promocao."
+
+      # --- ecommerce (STRUCT) ---
+      - name: ecommerce
+        type: STRUCT
+        description: "Dados agregados de e-commerce do evento. Presente em eventos de conversao (purchase, begin_checkout, add_to_cart)."
+        sub_fields:
+          - name: total_item_quantity
+            type: INTEGER
+            description: "Quantidade total de itens no evento."
+          - name: purchase_revenue_in_usd
+            type: FLOAT
+            description: "Receita da compra convertida para USD."
+          - name: purchase_revenue
+            type: FLOAT
+            description: "Receita da compra na moeda local. Este e o campo principal de receita para eventos purchase."
+          - name: refund_value_in_usd
+            type: FLOAT
+            description: "Valor total de reembolso em USD."
+          - name: refund_value
+            type: FLOAT
+            description: "Valor total de reembolso na moeda local."
+          - name: shipping_value_in_usd
+            type: FLOAT
+            description: "Valor do frete em USD."
+          - name: shipping_value
+            type: FLOAT
+            description: "Valor do frete na moeda local."
+          - name: tax_value_in_usd
+            type: FLOAT
+            description: "Valor de impostos em USD."
+          - name: tax_value
+            type: FLOAT
+            description: "Valor de impostos na moeda local."
+          - name: transaction_id
+            type: STRING
+            description: "ID unico da transacao. Essencial para deduplicar compras."
+          - name: unique_items
+            type: INTEGER
+            description: "Numero de itens unicos no evento."
+
+      # --- platform and stream ---
+      - name: platform
+        type: STRING
+        description: "Plataforma onde o evento foi coletado: WEB, IOS, ANDROID."
+
+      - name: stream_id
+        type: STRING
+        description: "ID do data stream no GA4. Cada plataforma (web, app) tem um stream_id diferente."
+
+      # --- other fields ---
+      - name: is_active_user
+        type: BOOLEAN
+        description: "Se o usuario esteve ativo no periodo do evento. Usado internamente pelo GA4 para metricas de usuarios ativos."
+
+      - name: batch_event_index
+        type: INTEGER
+        description: "Indice do evento dentro do batch enviado. Usado para ordenacao precisa de eventos dentro de um mesmo bundle."
+
+      - name: batch_ordering_id
+        type: INTEGER
+        description: "ID de ordenacao do batch. Usado para garantir a ordem correta dos batches de eventos."
+
+      - name: batch_page_id
+        type: INTEGER
+        description: "ID da pagina do batch. Presente apenas em eventos web."
+
+  - name: "events_intraday_*"
+    description: "Tabela de eventos intraday com mesma estrutura de events_*, atualizada em tempo real ao longo do dia. Ao final do dia, os dados sao movidos para events_YYYYMMDD e a tabela intraday e deletada. Use para dados do dia corrente que ainda nao foram consolidados."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields: "Mesma estrutura de events_* (todos os campos sao identicos)"

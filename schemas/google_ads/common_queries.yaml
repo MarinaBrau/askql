@@ -1,0 +1,203 @@
+source_name: google_ads
+display_name: "Google Ads BigQuery Transfer — Common Queries"
+description: "Templates de consultas frequentes para dados do Google Ads exportados via Data Transfer Service no BigQuery."
+
+templates:
+  # ============================================================
+  # PERFORMANCE — CPA, ROAS
+  # ============================================================
+
+  - title: "Campaign CPA"
+    category: performance
+    description: "Calcula o CPA (Custo por Aquisicao) de cada campanha, com JOIN deduplicado na tabela de configuracao para obter nomes."
+    natural_language: "Qual o CPA (custo por aquisicao) de cada campanha?"
+    sql: |
+      -- CPA (Custo por Aquisicao) por campanha
+      -- JOIN com ads_Campaign deduplicado via ROW_NUMBER para evitar inflacao
+      WITH campaigns_dedup AS (
+        SELECT
+          campaign_id,
+          campaign_name,
+          ROW_NUMBER() OVER (
+            PARTITION BY campaign_id
+            ORDER BY _TABLE_SUFFIX DESC
+          ) AS rn
+        FROM `{project_id}.{dataset}.ads_Campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      )
+      SELECT
+        c.campaign_name,
+        -- Custo total convertido de micros para moeda real
+        ROUND(SUM(s.metrics_cost_micros) / 1000000.0, 2) AS custo,
+        -- Total de conversoes (pode ser fracionario por modelo de atribuicao)
+        ROUND(SUM(s.metrics_conversions), 2) AS conversoes,
+        -- CPA = custo / conversoes (com NULLIF para evitar divisao por zero)
+        ROUND(
+          SUM(s.metrics_cost_micros) / 1000000.0
+          / NULLIF(SUM(s.metrics_conversions), 0),
+          2
+        ) AS cpa
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*` s
+      JOIN campaigns_dedup c
+        ON s.campaign_id = c.campaign_id AND c.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY c.campaign_name
+      ORDER BY custo DESC
+    explanation: >
+      Esta consulta mostra o Custo por Aquisicao (CPA) de cada campanha do Google Ads.
+      O CPA e calculado dividindo o custo total pelo numero de conversoes. Campanhas sem
+      conversoes aparecem com CPA nulo ao inves de erro de divisao por zero. A tabela de
+      campanhas e deduplicada com ROW_NUMBER para evitar inflacao de metricas causada por
+      multiplos snapshots do Data Transfer.
+
+  - title: "ROAS by Campaign"
+    category: performance
+    description: "Calcula o ROAS (Return on Ad Spend) de cada campanha, mostrando o retorno gerado para cada real investido."
+    natural_language: "Qual o ROAS de cada campanha?"
+    sql: |
+      -- ROAS (Return on Ad Spend) por campanha
+      -- JOIN com ads_Campaign deduplicado via ROW_NUMBER para evitar inflacao
+      WITH campaigns_dedup AS (
+        SELECT
+          campaign_id,
+          campaign_name,
+          ROW_NUMBER() OVER (
+            PARTITION BY campaign_id
+            ORDER BY _TABLE_SUFFIX DESC
+          ) AS rn
+        FROM `{project_id}.{dataset}.ads_Campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      )
+      SELECT
+        c.campaign_name,
+        -- Custo total convertido de micros para moeda real
+        ROUND(SUM(s.metrics_cost_micros) / 1000000.0, 2) AS custo,
+        -- Valor total das conversoes
+        ROUND(SUM(s.metrics_conversions_value), 2) AS valor_conversoes,
+        -- ROAS = valor das conversoes / custo (com NULLIF para evitar divisao por zero)
+        ROUND(
+          SUM(s.metrics_conversions_value)
+          / NULLIF(SUM(s.metrics_cost_micros) / 1000000.0, 0),
+          2
+        ) AS roas
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*` s
+      JOIN campaigns_dedup c
+        ON s.campaign_id = c.campaign_id AND c.rn = 1
+      WHERE s._TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY c.campaign_name
+      ORDER BY roas DESC
+    explanation: >
+      Esta consulta mostra o ROAS (Return on Ad Spend) de cada campanha. O ROAS indica
+      quantos reais de conversao foram gerados para cada real investido. Um ROAS de 5.0
+      significa que para cada R$1 gasto, R$5 retornaram em conversoes. Campanhas sem custo
+      aparecem com ROAS nulo. A tabela de campanhas e deduplicada com ROW_NUMBER para
+      evitar inflacao.
+
+  # ============================================================
+  # BUDGET — Tendencia de gasto
+  # ============================================================
+
+  - title: "Daily Spend Trend"
+    category: budget
+    description: "Mostra a tendencia de gasto diario com impressoes, cliques e CTR para acompanhar a evolucao do investimento."
+    natural_language: "Como esta a tendencia de gasto diario?"
+    sql: |
+      -- Tendencia de gasto diario com metricas de performance
+      -- Usa segments_date para agrupamento e _TABLE_SUFFIX para filtro eficiente
+      SELECT
+        s.segments_date,
+        -- Custo diario convertido de micros para moeda real
+        ROUND(SUM(s.metrics_cost_micros) / 1000000.0, 2) AS custo,
+        -- Volume de impressoes e cliques
+        SUM(s.metrics_impressions) AS impressoes,
+        SUM(s.metrics_clicks) AS cliques,
+        -- CTR calculado manualmente com NULLIF para evitar divisao por zero
+        ROUND(
+          SUM(s.metrics_clicks) * 100.0
+          / NULLIF(SUM(s.metrics_impressions), 0),
+          2
+        ) AS ctr_pct
+      FROM `{project_id}.{dataset}.ads_CampaignStats_*` s
+      WHERE s._TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY s.segments_date
+      ORDER BY s.segments_date
+    explanation: >
+      Esta consulta mostra como seu investimento diario no Google Ads evoluiu ao longo do
+      periodo. Para cada dia, exibe o custo total (convertido de micros para reais), impressoes,
+      cliques e CTR. Util para identificar picos de gasto, dias sem investimento e tendencias
+      de performance ao longo do tempo. O CTR (Click-Through Rate) em percentual indica a
+      eficiencia dos anuncios em gerar cliques.
+
+  # ============================================================
+  # KEYWORDS — Top keywords, CPA de keywords
+  # ============================================================
+
+  - title: "Top Keywords by Conversions"
+    category: keywords
+    description: "Lista as palavras-chave que mais geram conversoes, com custo, cliques, impressoes e CPA."
+    natural_language: "Quais keywords geram mais conversoes?"
+    sql: |
+      -- Top keywords por numero de conversoes
+      -- Dados direto de KeywordStats (ja contem keyword_text, sem necessidade de JOIN)
+      SELECT
+        k.keyword_text,
+        k.keyword_match_type AS match_type,
+        -- Metricas de volume
+        SUM(k.metrics_impressions) AS impressoes,
+        SUM(k.metrics_clicks) AS cliques,
+        -- Custo convertido de micros para moeda real
+        ROUND(SUM(k.metrics_cost_micros) / 1000000.0, 2) AS custo,
+        -- Conversoes totais
+        ROUND(SUM(k.metrics_conversions), 2) AS conversoes,
+        -- CPA da keyword com NULLIF para evitar divisao por zero
+        ROUND(
+          SUM(k.metrics_cost_micros) / 1000000.0
+          / NULLIF(SUM(k.metrics_conversions), 0),
+          2
+        ) AS cpa
+      FROM `{project_id}.{dataset}.ads_KeywordStats_*` k
+      WHERE k._TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY k.keyword_text, k.keyword_match_type
+      ORDER BY conversoes DESC
+      LIMIT 20
+    explanation: >
+      Esta consulta lista as 20 palavras-chave que mais geram conversoes no Google Ads.
+      Para cada keyword, mostra o tipo de correspondencia (EXACT, PHRASE, BROAD), impressoes,
+      cliques, custo e CPA. Ideal para identificar quais termos de busca realmente convertem
+      e otimizar o investimento focando nas keywords mais eficientes.
+
+  - title: "Keyword CPA Analysis"
+    category: keywords
+    description: "Analisa o CPA das keywords que tem pelo menos 1 conversao, ordenando do melhor (menor CPA) ao pior."
+    natural_language: "Quais keywords tem o melhor e pior CPA?"
+    sql: |
+      -- Analise de CPA por keyword (apenas keywords com conversoes)
+      -- Ordenado do melhor CPA (mais barato) ao pior
+      SELECT
+        k.keyword_text,
+        k.keyword_match_type AS match_type,
+        -- Metricas de volume
+        SUM(k.metrics_impressions) AS impressoes,
+        SUM(k.metrics_clicks) AS cliques,
+        -- Custo convertido de micros para moeda real
+        ROUND(SUM(k.metrics_cost_micros) / 1000000.0, 2) AS custo,
+        -- Conversoes totais
+        ROUND(SUM(k.metrics_conversions), 2) AS conversoes,
+        -- CPA da keyword com NULLIF para evitar divisao por zero
+        ROUND(
+          SUM(k.metrics_cost_micros) / 1000000.0
+          / NULLIF(SUM(k.metrics_conversions), 0),
+          2
+        ) AS cpa
+      FROM `{project_id}.{dataset}.ads_KeywordStats_*` k
+      WHERE k._TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY k.keyword_text, k.keyword_match_type
+      -- Filtra apenas keywords que geraram pelo menos 1 conversao
+      HAVING SUM(k.metrics_conversions) >= 1
+      ORDER BY cpa ASC
+      LIMIT 20
+    explanation: >
+      Esta consulta mostra as 20 keywords com melhor CPA (menor custo por conversao),
+      filtrando apenas aquelas que geraram pelo menos 1 conversao. Ordenar por CPA
+      ascendente coloca as keywords mais eficientes no topo. Compare com a query de
+      Top Keywords by Conversions para ter uma visao completa: volume vs eficiencia.

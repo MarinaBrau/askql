@@ -1,0 +1,252 @@
+source_name: shopify
+display_name: "Shopify — Common Queries"
+description: "Templates de consultas frequentes para dados de e-commerce Shopify no BigQuery (dataset shopify_treated)."
+
+templates:
+  # ============================================================
+  # VENDAS — Receita e performance de pedidos
+  # ============================================================
+
+  - title: "Receita por Dia"
+    category: vendas
+    description: "Evolucao diaria de receita, pedidos e ticket medio para pedidos pagos."
+    natural_language: "Qual foi a receita por dia?"
+    sql: |
+      -- Receita diaria de pedidos pagos — Shopify
+      -- Filtrar por dt (partition pruning) e financial_status = 'paid'
+      SELECT
+        dt AS data,
+        COUNT(DISTINCT order_id) AS pedidos,
+        ROUND(SUM(total_price), 2) AS receita,
+        ROUND(AVG(total_price), 2) AS ticket_medio,
+        ROUND(SUM(total_discounts), 2) AS descontos_totais,
+        ROUND(SUM(total_shipping_price_set), 2) AS frete_total
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+        AND financial_status = 'paid'
+      GROUP BY dt
+      ORDER BY dt
+    explanation: >
+      Esta consulta mostra a evolucao diaria de receita para pedidos com status 'paid'
+      (pagos). Para cada dia, exibe a quantidade de pedidos, receita total, ticket medio,
+      total de descontos concedidos e valor de frete. Os campos derivados (dt, order_date)
+      ja estao pre-calculados pelo pipeline. Util para identificar tendencias de vendas e
+      dias de pico de faturamento.
+
+  - title: "Top 10 Produtos Mais Vendidos"
+    category: vendas
+    description: "Ranking de produtos por receita com unidades vendidas e ticket medio — JOIN orders + order_items."
+    natural_language: "Quais sao os 10 produtos mais vendidos?"
+    sql: |
+      -- Top 10 produtos por receita — Shopify (JOIN orders + order_items)
+      SELECT
+        i.name AS produto,
+        i.vendor AS fornecedor,
+        SUM(i.quantity) AS unidades_vendidas,
+        COUNT(DISTINCT i.order_id) AS pedidos_com_produto,
+        ROUND(SUM(i.line_total), 2) AS receita_produto,
+        ROUND(AVG(i.price), 2) AS preco_medio
+      FROM `{project_id}.{dataset}.order_items_treated` i
+      JOIN `{project_id}.{dataset}.orders_treated` o ON i.order_id = o.order_id
+      WHERE i.dt BETWEEN '{date_start}' AND '{date_end}'
+        AND o.dt BETWEEN '{date_start}' AND '{date_end}'
+        AND o.financial_status = 'paid'
+      GROUP BY i.name, i.vendor
+      ORDER BY receita_produto DESC
+      LIMIT 10
+    explanation: >
+      Esta consulta lista os 10 produtos que geraram mais receita no periodo. O JOIN
+      entre order_items_treated e orders_treated garante que apenas pedidos pagos sejam
+      considerados. Para cada produto, mostra o fornecedor, total de unidades vendidas,
+      numero de pedidos distintos que incluiram o produto, receita total e preco medio.
+      O campo line_total ja considera descontos aplicados ao item.
+
+  - title: "Performance por Status Financeiro"
+    category: vendas
+    description: "Distribuicao de pedidos e receita por financial_status — util para monitorar reembolsos e cancelamentos."
+    natural_language: "Qual o volume de pedidos e receita por status financeiro?"
+    sql: |
+      -- Performance por status financeiro — Shopify
+      -- Inclui todos os status para visibilidade de reembolsos e cancelamentos
+      SELECT
+        financial_status AS status,
+        COUNT(DISTINCT order_id) AS total_pedidos,
+        ROUND(SUM(total_price), 2) AS receita_bruta,
+        ROUND(SUM(total_discounts), 2) AS descontos,
+        ROUND(AVG(total_price), 2) AS ticket_medio,
+        ROUND(COUNT(DISTINCT order_id) * 100.0 / SUM(COUNT(DISTINCT order_id)) OVER (), 1) AS pct_pedidos
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY financial_status
+      ORDER BY total_pedidos DESC
+    explanation: >
+      Esta consulta mostra a distribuicao de pedidos e receita por status financeiro.
+      Os status disponiveis sao: paid (pago), pending (pendente), authorized (autorizado),
+      refunded (reembolsado), voided (cancelado), partially_refunded e partially_paid.
+      Para receita real, use apenas o status 'paid'. Esta visao geral e util para
+      monitorar a taxa de reembolso e pedidos em aberto.
+
+  # ============================================================
+  # CLIENTES — Segmentacao e comportamento
+  # ============================================================
+
+  - title: "Segmentacao de Clientes por Valor"
+    category: clientes
+    description: "Distribuicao de clientes pelos segmentos de valor (no_purchase, low, medium, high, vip) com receita media."
+    natural_language: "Como esta a distribuicao de clientes por segmento de valor?"
+    sql: |
+      -- Segmentacao de clientes por valor total gasto — Shopify
+      -- customer_segment ja calculado pelo pipeline
+      SELECT
+        customer_segment AS segmento,
+        COUNT(DISTINCT customer_id) AS total_clientes,
+        ROUND(AVG(total_spent), 2) AS gasto_medio,
+        ROUND(AVG(avg_order_value), 2) AS ticket_medio,
+        ROUND(AVG(orders_count), 1) AS pedidos_medio,
+        ROUND(COUNT(DISTINCT customer_id) * 100.0 / SUM(COUNT(DISTINCT customer_id)) OVER (), 1) AS pct_clientes
+      FROM `{project_id}.{dataset}.customers_treated`
+      WHERE dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.customers_treated`)
+      GROUP BY customer_segment
+      ORDER BY
+        CASE customer_segment
+          WHEN 'vip' THEN 1
+          WHEN 'high_value' THEN 2
+          WHEN 'medium_value' THEN 3
+          WHEN 'low_value' THEN 4
+          ELSE 5
+        END
+    explanation: >
+      Esta consulta mostra a distribuicao de clientes pelos segmentos de valor calculados
+      pelo pipeline: vip (>=R$1000), high_value (R$500-999), medium_value (R$100-499),
+      low_value (<R$100) e no_purchase (sem compras). Para cada segmento, exibe o total
+      de clientes, gasto medio, ticket medio e numero medio de pedidos. Os dados refletem
+      o estado atual dos clientes (dt mais recente). Util para estrategias de retencao e
+      campanhas segmentadas.
+
+  - title: "Novos Clientes vs Recorrentes"
+    category: clientes
+    description: "Comparativo de pedidos e receita entre clientes novos (primeiro pedido) e recorrentes no periodo."
+    natural_language: "Quantos pedidos vieram de clientes novos vs recorrentes?"
+    sql: |
+      -- Novos vs recorrentes: usando frequency_segment de customers_treated
+      SELECT
+        CASE
+          WHEN c.frequency_segment = 'one_time' THEN 'novo (1 pedido)'
+          WHEN c.frequency_segment IN ('occasional', 'regular', 'frequent') THEN 'recorrente'
+          WHEN o.customer_id IS NULL THEN 'guest (sem cadastro)'
+          ELSE 'sem dados'
+        END AS tipo_cliente,
+        COUNT(DISTINCT o.order_id) AS pedidos,
+        ROUND(SUM(o.total_price), 2) AS receita,
+        ROUND(AVG(o.total_price), 2) AS ticket_medio
+      FROM `{project_id}.{dataset}.orders_treated` o
+      LEFT JOIN `{project_id}.{dataset}.customers_treated` c ON o.customer_id = c.customer_id
+        AND c.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.customers_treated`)
+      WHERE o.dt BETWEEN '{date_start}' AND '{date_end}'
+        AND o.financial_status = 'paid'
+      GROUP BY tipo_cliente
+      ORDER BY receita DESC
+    explanation: >
+      Esta consulta compara pedidos e receita entre clientes novos (apenas 1 pedido no
+      historico), recorrentes (mais de 1 pedido) e guests (sem cadastro na loja). Usa o
+      campo frequency_segment pre-calculado do customers_treated. Clientes recorrentes
+      tendem a ter ticket medio mais alto e custo de aquisicao menor. Util para avaliar
+      a taxa de recompra e o valor do cliente ao longo do tempo.
+
+  # ============================================================
+  # MARKETING — UTMs, canais e cupons
+  # ============================================================
+
+  - title: "Receita por Canal de Marketing (UTM Source)"
+    category: marketing
+    description: "Analise de canais de aquisicao por utm_source — receita, pedidos e ticket medio por canal."
+    natural_language: "Quais canais de marketing geram mais receita?"
+    sql: |
+      -- Receita por canal de aquisicao (utm_source) — Shopify
+      -- has_utm ja calculado pelo pipeline (TRUE se utm_source IS NOT NULL)
+      SELECT
+        COALESCE(utm_source, '(sem UTM / direto)') AS canal,
+        COUNT(DISTINCT order_id) AS pedidos,
+        ROUND(SUM(total_price), 2) AS receita,
+        ROUND(AVG(total_price), 2) AS ticket_medio,
+        ROUND(SUM(total_price) * 100.0 / SUM(SUM(total_price)) OVER (), 1) AS pct_receita
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+        AND financial_status = 'paid'
+      GROUP BY utm_source
+      ORDER BY receita DESC
+    explanation: >
+      Esta consulta mostra quais canais de marketing (utm_source) geraram mais receita e
+      pedidos no periodo. Pedidos sem UTM aparecem como '(sem UTM / direto)' — geralmente
+      representam acesso direto ou organico sem rastreamento. Para cada canal, mostra
+      pedidos, receita total, ticket medio e participacao percentual na receita. Util para
+      avaliar o retorno de cada investimento em midia paga e organico.
+
+  - title: "Analise de Cupons e Descontos"
+    category: marketing
+    description: "Pedidos, receita e desconto medio por cupom — para avaliar efetividade de campanhas promocionais."
+    natural_language: "Quais cupons foram mais usados e qual o desconto medio?"
+    sql: |
+      -- Analise de cupons — Shopify
+      -- has_coupon e coupon_code ja disponíveis como campos derivados
+      SELECT
+        coupon_code,
+        COUNT(DISTINCT order_id) AS pedidos_com_cupom,
+        ROUND(SUM(total_price), 2) AS receita_com_cupom,
+        ROUND(AVG(total_price), 2) AS ticket_medio,
+        ROUND(SUM(total_discounts), 2) AS desconto_total_concedido,
+        ROUND(AVG(total_discounts), 2) AS desconto_medio_por_pedido,
+        -- Percentual de desconto medio sobre receita bruta
+        ROUND(
+          SUM(total_discounts) * 100.0 / NULLIF(SUM(total_price + total_discounts), 0),
+          1
+        ) AS pct_desconto_medio
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+        AND financial_status = 'paid'
+        AND has_coupon = TRUE
+      GROUP BY coupon_code
+      ORDER BY pedidos_com_cupom DESC
+    explanation: >
+      Esta consulta analisa a efetividade dos cupons de desconto no periodo. Para cada
+      codigo de cupom, mostra quantos pedidos pagos utilizaram o cupom, a receita gerada,
+      o ticket medio, o total e a media de desconto concedido, e o percentual de desconto
+      sobre a receita bruta (antes do desconto). Usar o campo has_coupon = TRUE para
+      filtrar apenas pedidos com cupom. Util para avaliar quais promocoes performaram
+      melhor e qual o impacto dos descontos na margem.
+
+  # ============================================================
+  # PRODUTOS — Catalogo e estoque
+  # ============================================================
+
+  - title: "Produtos em Promocao e Estoque Critico"
+    category: produtos
+    description: "Produtos com desconto ativo (is_on_sale) e alerta de estoque baixo ou zerado."
+    natural_language: "Quais produtos estao em promocao e quais tem estoque critico?"
+    sql: |
+      -- Produtos em promocao e com estoque baixo/zerado — Shopify
+      -- is_on_sale, stock_level e has_stock ja calculados pelo pipeline
+      SELECT
+        title AS produto,
+        vendor AS fornecedor,
+        product_type AS categoria,
+        ROUND(price, 2) AS preco_atual,
+        ROUND(compare_at_price, 2) AS preco_original,
+        ROUND(discount_percentage, 1) AS desconto_pct,
+        is_on_sale,
+        stock_level AS nivel_estoque,
+        inventory_quantity AS qtd_estoque,
+        status AS status_produto
+      FROM `{project_id}.{dataset}.products_treated`
+      WHERE dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.products_treated`)
+        AND status = 'active'
+        AND (is_on_sale = TRUE OR stock_level IN ('out_of_stock', 'low_stock'))
+      ORDER BY
+        CASE stock_level WHEN 'out_of_stock' THEN 1 WHEN 'low_stock' THEN 2 ELSE 3 END,
+        discount_percentage DESC
+    explanation: >
+      Esta consulta lista os produtos ativos que merecem atencao: os que estao em
+      promocao (compare_at_price > price) e/ou com estoque critico (zerado ou baixo,
+      1-5 unidades). Os campos is_on_sale, stock_level, discount_percentage e has_stock
+      ja sao calculados pelo pipeline — nao e necessario recalcular. Util para gestao
+      de catalogo, reposicao de estoque e monitoramento de promocoes ativas.

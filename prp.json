@@ -1,0 +1,207 @@
+{
+  "project": {
+    "name": "AskQL",
+    "description": "Fase B — Cross-Source JOINs backend: relationships, loader, context_builder, query_engine, validation",
+    "branchName": "saci/fase-b-cross-source"
+  },
+  "features": [
+    {
+      "id": "F1",
+      "name": "Cross-Source JOINs Backend",
+      "description": "Support queries combining data from two different sources (GA4+Google Ads, GA4+Meta Ads, etc.)",
+      "priority": 1,
+      "tasks": [
+        {
+          "id": "F1-T1",
+          "title": "Create cross-source relationships.yaml",
+          "description": "Create schemas/cross_source/relationships.yaml documenting how pairs of sources can be combined. Include GA4↔Google Ads (date-based + UTM), GA4↔Meta Ads (date-based + UTM), Google Ads↔Meta Ads (date-based). Each relationship documents: sources, JOIN strategy, confidence level, required conversions (date format, currency), and example SQL.",
+          "priority": 1,
+          "passes": false,
+          "context": {
+            "files": [
+              "schemas/google_ads/relationships.yaml",
+              "schemas/meta_ads/relationships.yaml",
+              "schemas/ga4_bigquery/relationships.yaml",
+              "schemas/google_ads/schema.yaml",
+              "schemas/meta_ads/schema.yaml",
+              "schemas/ga4_bigquery/schema.yaml"
+            ],
+            "libraries": [],
+            "hints": [
+              "Follow same YAML structure as intra-source relationships but add: sources (list of 2), strategy (date_based/utm_based), confidence (high/medium/low), required_conversions (list)",
+              "Date formats: GA4 event_date=YYYYMMDD, Google Ads segments_date=YYYY-MM-DD, Meta date_start=YYYY-MM-DD",
+              "Currency: Google Ads metrics_cost_micros /1M, Meta spend already in reais",
+              "Date-based JOINs are high confidence, UTM-based are medium confidence"
+            ]
+          },
+          "acceptance": [
+            "File schemas/cross_source/relationships.yaml exists and is valid YAML",
+            "Contains GA4 <-> Google Ads relationships (date-based and UTM-based)",
+            "Contains GA4 <-> Meta Ads relationships (date-based and UTM-based)",
+            "Contains Google Ads <-> Meta Ads relationships (date-based only)",
+            "Each relationship has: sources, strategy, confidence, required_conversions, example_sql",
+            "Example SQL demonstrates correct date alignment and currency normalization"
+          ],
+          "tests": {
+            "command": "python3 -c \"import yaml; data=yaml.safe_load(open('schemas/cross_source/relationships.yaml')); assert len(data['relationships']) >= 5; print(f'OK: {len(data[\"relationships\"])} relationships')\""
+          }
+        },
+        {
+          "id": "F1-T2",
+          "title": "Add load_cross_source_relationships to loader",
+          "description": "Add function load_cross_source_relationships(source_a, source_b) to schemas/loader.py that loads cross-source relationships filtered by the given pair of sources. Returns empty list if file doesn't exist. Order of source_a/source_b shouldn't matter (symmetric lookup).",
+          "priority": 2,
+          "passes": false,
+          "context": {
+            "files": [
+              "schemas/loader.py"
+            ],
+            "libraries": ["pyyaml"],
+            "hints": [
+              "Cross-source file is at schemas/cross_source/relationships.yaml",
+              "Filter: return only relationships where {source_a, source_b} matches the 'sources' field",
+              "Make lookup symmetric: (ga4, google_ads) == (google_ads, ga4)",
+              "Graceful fallback: if file doesn't exist, return []"
+            ]
+          },
+          "acceptance": [
+            "Function load_cross_source_relationships(source_a, source_b) exists in schemas/loader.py",
+            "Returns list of relationships filtered by source pair",
+            "Symmetric: load_cross_source_relationships('ga4_bigquery', 'google_ads') == load_cross_source_relationships('google_ads', 'ga4_bigquery')",
+            "Returns empty list if relationships.yaml doesn't exist",
+            "Existing load_schema() and list_sources() still work unchanged"
+          ],
+          "tests": {
+            "command": "python3 -c \"from schemas.loader import load_cross_source_relationships, load_schema; r=load_cross_source_relationships('ga4_bigquery','google_ads'); print(f'GA4+GAds: {len(r)} rels'); r2=load_cross_source_relationships('google_ads','ga4_bigquery'); assert len(r)==len(r2), 'Not symmetric'; s=load_schema('google_ads'); assert 'relationships' in s; print('All OK')\""
+          }
+        },
+        {
+          "id": "F1-T3",
+          "title": "Add multi-source support to context_builder",
+          "description": "Extend build_context() to accept optional secondary_source and secondary_dataset. When provided: include schema of both sources, add Cross-Source Relationships section with alignment rules and examples. Keep secondary schema concise (key tables/fields only). When not provided, behavior identical to current.",
+          "priority": 3,
+          "passes": false,
+          "context": {
+            "files": [
+              "core/context_builder.py",
+              "schemas/loader.py"
+            ],
+            "libraries": [],
+            "hints": [
+              "Add optional params: secondary_source=None, secondary_dataset=None",
+              "When secondary_source set: load both schemas, load cross_source relationships",
+              "Add new section '## Cross-Source Relationships' after Table Relationships",
+              "Include alignment rules: date format conversion, currency normalization",
+              "Keep secondary schema concise: only table names + key fields, skip sub_fields",
+              "Add _format_cross_source_relationships() helper function",
+              "User prompt should mention both sources when cross-source"
+            ]
+          },
+          "acceptance": [
+            "build_context() accepts secondary_source and secondary_dataset optional params",
+            "When secondary_source=None, output identical to current (zero regression)",
+            "When secondary_source set, prompt includes schemas of both sources",
+            "Prompt includes '## Cross-Source Relationships' section with alignment rules",
+            "Prompt includes date format conversion rules and currency normalization rules",
+            "User prompt mentions both sources when cross-source",
+            "Total prompt size < 10k tokens for any cross-source combination"
+          ],
+          "tests": {
+            "command": "python3 -c \"from core.context_builder import build_context; ctx1=build_context('google_ads','p','d','test'); assert '## Cross-Source' not in ctx1['system_prompt'], 'Regression'; ctx2=build_context('ga4_bigquery','p','d','test',secondary_source='google_ads',secondary_dataset='d2'); assert '## Cross-Source' in ctx2['system_prompt'], 'Missing cross-source'; print('All OK')\""
+          }
+        },
+        {
+          "id": "F1-T4",
+          "title": "Add multi-source support to query_engine",
+          "description": "Extend generate_query() to accept optional secondary_source and secondary_dataset, passing them through to build_context(). QueryResult unchanged.",
+          "priority": 4,
+          "passes": false,
+          "context": {
+            "files": [
+              "core/query_engine.py",
+              "core/context_builder.py"
+            ],
+            "libraries": [],
+            "hints": [
+              "Add optional params with default None",
+              "Pass through to build_context()",
+              "No changes to QueryResult dataclass",
+              "No changes to validation or formatting pipeline"
+            ]
+          },
+          "acceptance": [
+            "generate_query() accepts secondary_source and secondary_dataset optional params",
+            "Passes params to build_context()",
+            "When params not provided, behavior identical to current",
+            "QueryResult dataclass unchanged"
+          ],
+          "tests": {
+            "command": "python3 -c \"from core.query_engine import generate_query; import inspect; sig=inspect.signature(generate_query); assert 'secondary_source' in sig.parameters; assert 'secondary_dataset' in sig.parameters; print('Signature OK')\""
+          }
+        },
+        {
+          "id": "F1-T5",
+          "title": "Add cross-source quality checks",
+          "description": "Add two new quality checks: cross_source_date_alignment (verifies date format conversion when combining sources) and cross_source_currency (verifies currency normalization when combining Google Ads micros with Meta Ads reais). Extend run_checks() to accept optional is_cross_source flag.",
+          "priority": 5,
+          "passes": false,
+          "context": {
+            "files": [
+              "validation/quality_checks.py"
+            ],
+            "libraries": [],
+            "hints": [
+              "cross_source_date_alignment: check for PARSE_DATE, FORMAT_DATE, CAST AS DATE, or consistent date format usage",
+              "cross_source_currency: if SQL references both cost_micros and spend, check that cost_micros is divided by 1M",
+              "Add applies_to: ['cross_source'] — only run when is_cross_source=True",
+              "run_checks() gets optional is_cross_source=False param; when True, also runs cross_source checks",
+              "Existing 13 checks must not be affected"
+            ]
+          },
+          "acceptance": [
+            "check_cross_source_date_alignment function exists and detects missing date conversion",
+            "check_cross_source_currency function exists and detects mixed currency without normalization",
+            "Both checks registered in ALL_CHECKS with applies_to=['cross_source']",
+            "run_checks() accepts optional is_cross_source param (default False)",
+            "When is_cross_source=False, cross_source checks are not run (backward compatible)",
+            "When is_cross_source=True, cross_source checks run in addition to source-specific checks",
+            "All 13 existing checks still pass (zero regression)"
+          ],
+          "tests": {
+            "command": "python3 -c \"from validation.quality_checks import run_checks; r=run_checks('SELECT 1','google_ads'); assert len([c for c in r if 'cross_source' in c['id']])==0, 'Cross-source checks should not run by default'; r2=run_checks('SELECT 1','google_ads',is_cross_source=True); assert len([c for c in r2 if 'cross_source' in c['id']])>=2, 'Cross-source checks missing'; print(f'Default: {len(r)} checks, Cross: {len(r2)} checks — OK')\""
+          }
+        },
+        {
+          "id": "F1-T6",
+          "title": "Add cross-source test questions and validate",
+          "description": "Add 3+ cross-source test questions to validation/test_questions.py covering GA4+Google Ads, GA4+Meta Ads, Google Ads+Meta Ads. Update validate.py to pass secondary params to generate_query and run_checks. Run dry-run validation to ensure framework handles them without errors.",
+          "priority": 6,
+          "passes": false,
+          "context": {
+            "files": [
+              "validation/test_questions.py",
+              "validation/validate.py"
+            ],
+            "libraries": [],
+            "hints": [
+              "Test questions need new fields: secondary_source, secondary_dataset",
+              "validate.py needs to pass secondary params to generate_query and run_checks",
+              "Dry-run should work without API key",
+              "Example questions: 'Qual a relacao entre sessoes do GA4 e gastos do Google Ads por dia?', 'Compare investimento Meta vs Google Ads por semana'"
+            ]
+          },
+          "acceptance": [
+            "At least 3 cross-source test questions added to test_questions.py",
+            "Questions cover: GA4+Google Ads, GA4+Meta Ads, Google Ads+Meta Ads",
+            "validate.py handles cross-source questions (passes secondary_source/dataset)",
+            "Dry-run validation runs without errors for all questions (single + cross-source)",
+            "Total check pass rate remains high (no regressions on existing questions)"
+          ],
+          "tests": {
+            "command": "cd /home/mb/askql && python3 -m validation.validate --dry-run"
+          }
+        }
+      ]
+    }
+  ]
+}

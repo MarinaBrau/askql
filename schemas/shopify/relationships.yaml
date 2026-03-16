@@ -1,0 +1,89 @@
+source_name: shopify
+description: >
+  Relacionamentos entre tabelas do dataset shopify_treated no BigQuery.
+  IMPORTANTE: Todas as tabelas sao views deduplicadas (ROW_NUMBER ja aplicado
+  pelo pipeline). NAO adicionar ROW_NUMBER ou deduplicacao nas queries.
+  Filtrar por dt para partition pruning. Para products e customers (catalogo),
+  usar dt = (SELECT MAX(dt) FROM ...) para obter estado atual.
+
+relationships:
+  # =========================================================================
+  # orders_treated → order_items_treated (1:N)
+  # =========================================================================
+  - name: "orders_to_items"
+    from_table: "orders_treated"
+    to_table: "order_items_treated"
+    join_key: "order_id"
+    join_key_to: "order_id"
+    cardinality: "1:N"
+    requires_dedup: false
+    useful_fields: [item_id, product_id, variant_id, name, sku, quantity, price, line_total, has_discount, discount_percentage]
+    gotcha: "Ambas particionadas por dt. Filtrar dt em ambas as tabelas. Views ja deduplicadas — nao adicionar ROW_NUMBER."
+    example_sql: |
+      -- Top produtos vendidos com status do pedido
+      SELECT
+        i.name AS produto,
+        o.financial_status,
+        SUM(i.quantity) AS unidades,
+        ROUND(SUM(i.line_total), 2) AS receita
+      FROM `{project_id}.{dataset}.orders_treated` o
+      JOIN `{project_id}.{dataset}.order_items_treated` i ON o.order_id = i.order_id
+      WHERE o.dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND i.dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND o.financial_status = 'paid'
+      GROUP BY i.name, o.financial_status
+      ORDER BY receita DESC
+      LIMIT 10
+
+  # =========================================================================
+  # order_items_treated → products_treated (N:1)
+  # =========================================================================
+  - name: "items_to_products"
+    from_table: "order_items_treated"
+    to_table: "products_treated"
+    join_key: "product_id"
+    join_key_to: "product_id"
+    cardinality: "N:1"
+    requires_dedup: false
+    useful_fields: [title, vendor, product_type, price, compare_at_price, is_on_sale, has_stock, stock_level, tags]
+    gotcha: "products_treated e atualizado diariamente. Usar dt = MAX(dt) para o estado mais recente do catalogo. product_id pode ser NULL em order_items se o produto foi deletado — usar LEFT JOIN."
+    example_sql: |
+      -- Receita por tipo de produto com info do catalogo
+      SELECT
+        p.product_type AS categoria,
+        p.vendor AS fornecedor,
+        SUM(i.quantity) AS unidades_vendidas,
+        ROUND(SUM(i.line_total), 2) AS receita
+      FROM `{project_id}.{dataset}.order_items_treated` i
+      LEFT JOIN `{project_id}.{dataset}.products_treated` p ON i.product_id = p.product_id
+        AND p.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.products_treated`)
+      WHERE i.dt BETWEEN '2026-01-01' AND '2026-01-31'
+      GROUP BY p.product_type, p.vendor
+      ORDER BY receita DESC
+
+  # =========================================================================
+  # orders_treated → customers_treated (N:1)
+  # =========================================================================
+  - name: "orders_to_customers"
+    from_table: "orders_treated"
+    to_table: "customers_treated"
+    join_key: "customer_id"
+    join_key_to: "customer_id"
+    cardinality: "N:1"
+    requires_dedup: false
+    useful_fields: [customer_segment, frequency_segment, avg_order_value, orders_count, total_spent, city, state, country, accepts_marketing]
+    gotcha: "Pedidos guest tem customer_id NULL — usar LEFT JOIN para incluir todos os pedidos. customers_treated usar MAX(dt) para estado atual."
+    example_sql: |
+      -- Receita por segmento de cliente
+      SELECT
+        COALESCE(c.customer_segment, '(guest)') AS segmento,
+        COUNT(DISTINCT o.order_id) AS pedidos,
+        ROUND(SUM(o.total_price), 2) AS receita,
+        ROUND(AVG(o.total_price), 2) AS ticket_medio
+      FROM `{project_id}.{dataset}.orders_treated` o
+      LEFT JOIN `{project_id}.{dataset}.customers_treated` c ON o.customer_id = c.customer_id
+        AND c.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.customers_treated`)
+      WHERE o.dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND o.financial_status = 'paid'
+      GROUP BY segmento
+      ORDER BY receita DESC

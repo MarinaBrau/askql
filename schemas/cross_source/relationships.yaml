@@ -1,0 +1,685 @@
+description: >
+  Relacionamentos cross-source — como combinar dados de fontes diferentes.
+  Cross-source JOINs nao tem foreign keys diretas. A ligacao e feita via
+  agregacao por data (alta confianca) ou via UTM parameters (media confianca).
+
+alignment_rules:
+  date_formats:
+    ga4_bigquery: "event_date (STRING, formato YYYYMMDD sem hifens)"
+    google_ads: "segments_date (STRING, formato YYYY-MM-DD com hifens)"
+    meta_ads: "date_start (STRING, formato YYYY-MM-DD com hifens)"
+    vtex: "dt (DATE, formato YYYY-MM-DD — coluna de particionamento; usar diretamente em BETWEEN)"
+    shopify: "dt (DATE, formato YYYY-MM-DD — coluna de particionamento; usar diretamente em BETWEEN — mesmo formato que VTEX)"
+    conversion_tip: "Use PARSE_DATE('%Y%m%d', event_date) para GA4 alinhar com os demais. Google Ads/Meta Ads/VTEX/Shopify: usar o campo de data nativo (PARSE_DATE ou dt diretamente). VTEX e Shopify ja sao DATE no mesmo formato — join direto por dt."
+  currency:
+    google_ads: "metrics_cost_micros — dividir por 1000000.0 para obter valor em moeda real"
+    meta_ads: "spend — ja esta em moeda real (NAO dividir)"
+    vtex: "total_value, price, selling_price, etc. — ja estao em reais (pipeline converteu centavos para reais — NAO dividir por 100)"
+    shopify: "total_price, price, line_total, etc. — ja estao em moeda real (FLOAT direto da API Shopify — NAO converter)"
+    normalization_tip: "Sempre converter cost_micros / 1000000.0 para Google Ads. Meta Ads, VTEX e Shopify ja estao em moeda real — usar diretamente. VTEX e Shopify podem ser somados diretamente sem conversao."
+
+relationships:
+  # =========================================================================
+  # GA4 ↔ Google Ads — date-based (HIGH confidence)
+  # =========================================================================
+  - name: "ga4_gads_daily_spend_vs_sessions"
+    sources: ["ga4_bigquery", "google_ads"]
+    strategy: "date_based"
+    confidence: "high"
+    description: "Combinar metricas diarias do GA4 (sessoes, usuarios, conversoes) com gastos do Google Ads por dia"
+    join_approach: "Agregar cada fonte por data, depois JOIN por data alinhada"
+    required_conversions:
+      - "GA4 event_date (YYYYMMDD) → PARSE_DATE('%Y%m%d', event_date) para tipo DATE"
+      - "Google Ads segments_date (YYYY-MM-DD) → PARSE_DATE('%Y-%m-%d', segments_date) para tipo DATE"
+      - "Google Ads metrics_cost_micros / 1000000.0 para moeda real"
+    example_sql: |
+      WITH ga4_daily AS (
+        SELECT
+          PARSE_DATE('%Y%m%d', event_date) AS data,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id'))) AS sessoes,
+          COUNT(DISTINCT user_pseudo_id) AS usuarios
+        FROM `{project_id}.{dataset_ga4}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_ga4}' AND '{date_end_ga4}'
+        GROUP BY data
+      ),
+      gads_daily AS (
+        SELECT
+          PARSE_DATE('%Y-%m-%d', segments_date) AS data,
+          SUM(metrics_cost_micros) / 1000000.0 AS custo,
+          SUM(metrics_clicks) AS cliques,
+          SUM(metrics_impressions) AS impressoes
+        FROM `{project_id}.{dataset_gads}.ads_CampaignStats_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_gads}' AND '{date_end_gads}'
+        GROUP BY data
+      )
+      SELECT
+        COALESCE(g.data, a.data) AS data,
+        g.sessoes,
+        g.usuarios,
+        a.custo,
+        a.cliques,
+        a.impressoes
+      FROM ga4_daily g
+      FULL OUTER JOIN gads_daily a ON g.data = a.data
+      ORDER BY data
+
+  # =========================================================================
+  # GA4 ↔ Google Ads — UTM-based (MEDIUM confidence)
+  # =========================================================================
+  - name: "ga4_gads_utm_campaign"
+    sources: ["ga4_bigquery", "google_ads"]
+    strategy: "utm_based"
+    confidence: "medium"
+    description: "Combinar GA4 com Google Ads via nome de campanha (UTM campaign no GA4 = campaign_name no Google Ads)"
+    join_approach: "Extrair campaign de event_params no GA4, JOIN com ads_Campaign para nome"
+    required_conversions:
+      - "GA4: extrair campaign de event_params via UNNEST"
+      - "Google Ads: deduplicar ads_Campaign com ROW_NUMBER antes do JOIN"
+      - "Google Ads: metrics_cost_micros / 1000000.0 para moeda real"
+    caveat: "Depende de UTMs estarem configurados corretamente nas campanhas Google Ads. Se UTMs nao estiverem configurados, o campo campaign no GA4 sera (not set)"
+    example_sql: |
+      WITH ga4_campaigns AS (
+        SELECT
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign') AS campaign_name,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id'))) AS sessoes
+        FROM `{project_id}.{dataset_ga4}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_ga4}' AND '{date_end_ga4}'
+        GROUP BY campaign_name
+      ),
+      gads_campaigns AS (
+        SELECT
+          c.campaign_name,
+          SUM(s.metrics_cost_micros) / 1000000.0 AS custo,
+          SUM(s.metrics_clicks) AS cliques
+        FROM `{project_id}.{dataset_gads}.ads_CampaignStats_*` s
+        JOIN (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+          FROM `{project_id}.{dataset_gads}.ads_Campaign_*`
+        ) c ON s.campaign_id = c.campaign_id AND c.rn = 1
+        WHERE s._TABLE_SUFFIX BETWEEN '{date_start_gads}' AND '{date_end_gads}'
+        GROUP BY c.campaign_name
+      )
+      SELECT
+        COALESCE(g.campaign_name, a.campaign_name) AS campanha,
+        g.sessoes,
+        a.custo,
+        a.cliques
+      FROM ga4_campaigns g
+      FULL OUTER JOIN gads_campaigns a ON g.campaign_name = a.campaign_name
+      ORDER BY a.custo DESC NULLS LAST
+
+  # =========================================================================
+  # GA4 ↔ Meta Ads — date-based (HIGH confidence)
+  # =========================================================================
+  - name: "ga4_meta_daily_spend_vs_sessions"
+    sources: ["ga4_bigquery", "meta_ads"]
+    strategy: "date_based"
+    confidence: "high"
+    description: "Combinar metricas diarias do GA4 (sessoes, usuarios) com gastos do Meta Ads por dia"
+    join_approach: "Agregar cada fonte por data, depois JOIN por data alinhada"
+    required_conversions:
+      - "GA4 event_date (YYYYMMDD) → PARSE_DATE('%Y%m%d', event_date) para tipo DATE"
+      - "Meta Ads date_start (YYYY-MM-DD) → PARSE_DATE('%Y-%m-%d', date_start) para tipo DATE"
+      - "Meta Ads spend ja esta em moeda real — usar diretamente"
+    example_sql: |
+      WITH ga4_daily AS (
+        SELECT
+          PARSE_DATE('%Y%m%d', event_date) AS data,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id'))) AS sessoes,
+          COUNT(DISTINCT user_pseudo_id) AS usuarios
+        FROM `{project_id}.{dataset_ga4}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_ga4}' AND '{date_end_ga4}'
+        GROUP BY data
+      ),
+      meta_daily AS (
+        SELECT
+          PARSE_DATE('%Y-%m-%d', date_start) AS data,
+          SUM(spend) AS custo,
+          SUM(impressions) AS impressoes,
+          SUM(link_clicks) AS cliques
+        FROM `{project_id}.{dataset_meta}.meta_ads_insights_campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_meta}' AND '{date_end_meta}'
+        GROUP BY data
+      )
+      SELECT
+        COALESCE(g.data, m.data) AS data,
+        g.sessoes,
+        g.usuarios,
+        m.custo,
+        m.impressoes,
+        m.cliques
+      FROM ga4_daily g
+      FULL OUTER JOIN meta_daily m ON g.data = m.data
+      ORDER BY data
+
+  # =========================================================================
+  # GA4 ↔ Meta Ads — UTM-based (MEDIUM confidence)
+  # =========================================================================
+  - name: "ga4_meta_utm_campaign"
+    sources: ["ga4_bigquery", "meta_ads"]
+    strategy: "utm_based"
+    confidence: "medium"
+    description: "Combinar GA4 com Meta Ads via nome de campanha (UTM campaign no GA4 = campaign_name no Meta)"
+    join_approach: "Extrair campaign de event_params no GA4, JOIN com campaign_name do Meta Ads"
+    required_conversions:
+      - "GA4: extrair campaign de event_params via UNNEST"
+      - "Meta Ads: spend ja esta em moeda real"
+    caveat: "Depende de UTMs estarem configurados nas campanhas Meta Ads. Se nao estiverem, o campo campaign no GA4 sera (not set)"
+    example_sql: |
+      WITH ga4_campaigns AS (
+        SELECT
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign') AS campaign_name,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id'))) AS sessoes
+        FROM `{project_id}.{dataset_ga4}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_ga4}' AND '{date_end_ga4}'
+        GROUP BY campaign_name
+      ),
+      meta_campaigns AS (
+        SELECT
+          campaign_name,
+          SUM(spend) AS custo,
+          SUM(impressions) AS impressoes
+        FROM `{project_id}.{dataset_meta}.meta_ads_insights_campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_meta}' AND '{date_end_meta}'
+        GROUP BY campaign_name
+      )
+      SELECT
+        COALESCE(g.campaign_name, m.campaign_name) AS campanha,
+        g.sessoes,
+        m.custo,
+        m.impressoes
+      FROM ga4_campaigns g
+      FULL OUTER JOIN meta_campaigns m ON g.campaign_name = m.campaign_name
+      ORDER BY m.custo DESC NULLS LAST
+
+  # =========================================================================
+  # Google Ads ↔ Meta Ads — date-based (HIGH confidence)
+  # =========================================================================
+  - name: "gads_meta_daily_spend_comparison"
+    sources: ["google_ads", "meta_ads"]
+    strategy: "date_based"
+    confidence: "high"
+    description: "Comparar gastos e metricas diarias entre Google Ads e Meta Ads"
+    join_approach: "Agregar cada fonte por data, depois JOIN por data alinhada"
+    required_conversions:
+      - "Google Ads segments_date (YYYY-MM-DD) → PARSE_DATE('%Y-%m-%d', segments_date) para tipo DATE"
+      - "Meta Ads date_start (YYYY-MM-DD) → PARSE_DATE('%Y-%m-%d', date_start) para tipo DATE"
+      - "Google Ads metrics_cost_micros / 1000000.0 para moeda real"
+      - "Meta Ads spend ja esta em moeda real"
+    example_sql: |
+      WITH gads_daily AS (
+        SELECT
+          PARSE_DATE('%Y-%m-%d', segments_date) AS data,
+          SUM(metrics_cost_micros) / 1000000.0 AS custo_google,
+          SUM(metrics_clicks) AS cliques_google,
+          SUM(metrics_impressions) AS impressoes_google
+        FROM `{project_id}.{dataset_gads}.ads_CampaignStats_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_gads}' AND '{date_end_gads}'
+        GROUP BY data
+      ),
+      meta_daily AS (
+        SELECT
+          PARSE_DATE('%Y-%m-%d', date_start) AS data,
+          SUM(spend) AS custo_meta,
+          SUM(link_clicks) AS cliques_meta,
+          SUM(impressions) AS impressoes_meta
+        FROM `{project_id}.{dataset_meta}.meta_ads_insights_campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_meta}' AND '{date_end_meta}'
+        GROUP BY data
+      )
+      SELECT
+        COALESCE(g.data, m.data) AS data,
+        g.custo_google,
+        m.custo_meta,
+        g.custo_google + m.custo_meta AS custo_total,
+        g.cliques_google,
+        m.cliques_meta,
+        g.impressoes_google,
+        m.impressoes_meta
+      FROM gads_daily g
+      FULL OUTER JOIN meta_daily m ON g.data = m.data
+      ORDER BY data
+
+  # =========================================================================
+  # VTEX ↔ Google Ads — UTM-based (MEDIUM confidence)
+  # =========================================================================
+  - name: "vtex_gads_utm_campaign"
+    sources: ["vtex", "google_ads"]
+    strategy: "utm_based"
+    confidence: "medium"
+    description: "Combinar pedidos VTEX com gastos do Google Ads via utm_campaign — ROAS estimado por campanha"
+    join_approach: "Agregar VTEX por utm_campaign (filtrar utm_source = 'google'), JOIN com gastos do Google Ads por campaign_name"
+    required_conversions:
+      - "VTEX: filtrar utm_source = 'google' e utm_campaign IS NOT NULL"
+      - "VTEX: filtrar dt para partition pruning"
+      - "Google Ads: metrics_cost_micros / 1000000.0 para moeda real"
+      - "Google Ads: deduplicar ads_Campaign com ROW_NUMBER antes do JOIN"
+    caveat: "Confianca media — depende de UTMs configurados nas campanhas Google Ads. Pedidos sem UTM nao aparecem. utm_campaign deve coincidir com campaign_name do Google Ads."
+    example_sql: |
+      WITH vtex_campanhas AS (
+        SELECT
+          utm_campaign,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_value), 2) AS receita_vtex
+        FROM `{project_id}.{dataset_vtex}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND status = 'invoiced'
+          AND utm_source = 'google'
+          AND utm_campaign IS NOT NULL
+        GROUP BY utm_campaign
+      ),
+      gads_campanhas AS (
+        SELECT
+          c.campaign_name,
+          ROUND(SUM(s.metrics_cost_micros) / 1000000.0, 2) AS custo_google
+        FROM `{project_id}.{dataset_gads}.ads_CampaignStats_*` s
+        JOIN (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+          FROM `{project_id}.{dataset_gads}.ads_Campaign_*`
+        ) c ON s.campaign_id = c.campaign_id AND c.rn = 1
+        WHERE s._TABLE_SUFFIX BETWEEN '{date_start_gads}' AND '{date_end_gads}'
+        GROUP BY c.campaign_name
+      )
+      SELECT
+        COALESCE(v.utm_campaign, g.campaign_name) AS campanha,
+        v.pedidos,
+        v.receita_vtex,
+        g.custo_google,
+        ROUND(v.receita_vtex / NULLIF(g.custo_google, 0), 2) AS roas_estimado
+      FROM vtex_campanhas v
+      FULL OUTER JOIN gads_campanhas g ON v.utm_campaign = g.campaign_name
+      ORDER BY v.receita_vtex DESC NULLS LAST
+
+  # =========================================================================
+  # VTEX ↔ Meta Ads — UTM-based (MEDIUM confidence)
+  # =========================================================================
+  - name: "vtex_meta_utm_campaign"
+    sources: ["vtex", "meta_ads"]
+    strategy: "utm_based"
+    confidence: "medium"
+    description: "Combinar pedidos VTEX com gastos do Meta Ads via utm_campaign — ROAS estimado por campanha"
+    join_approach: "Agregar VTEX por utm_campaign (filtrar utm_source = 'facebook' ou 'instagram'), JOIN com gastos do Meta Ads por campaign_name"
+    required_conversions:
+      - "VTEX: filtrar utm_source IN ('facebook', 'instagram') e utm_campaign IS NOT NULL"
+      - "VTEX: filtrar dt para partition pruning"
+      - "Meta Ads: spend ja esta em moeda real — usar diretamente"
+      - "Meta Ads: filtrar _TABLE_SUFFIX para periodo equivalente"
+    caveat: "Confianca media — depende de UTMs configurados nas campanhas Meta Ads. utm_source pode ser 'facebook', 'instagram' ou o nome definido na campanha. utm_campaign deve coincidir com campaign_name do Meta Ads."
+    example_sql: |
+      WITH vtex_campanhas AS (
+        SELECT
+          utm_campaign,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_value), 2) AS receita_vtex
+        FROM `{project_id}.{dataset_vtex}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND status = 'invoiced'
+          AND utm_source IN ('facebook', 'instagram', 'meta')
+          AND utm_campaign IS NOT NULL
+        GROUP BY utm_campaign
+      ),
+      meta_campanhas AS (
+        SELECT
+          campaign_name,
+          ROUND(SUM(spend), 2) AS custo_meta
+        FROM `{project_id}.{dataset_meta}.meta_ads_insights_campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_meta}' AND '{date_end_meta}'
+        GROUP BY campaign_name
+      )
+      SELECT
+        COALESCE(v.utm_campaign, m.campaign_name) AS campanha,
+        v.pedidos,
+        v.receita_vtex,
+        m.custo_meta,
+        ROUND(v.receita_vtex / NULLIF(m.custo_meta, 0), 2) AS roas_estimado
+      FROM vtex_campanhas v
+      FULL OUTER JOIN meta_campanhas m ON v.utm_campaign = m.campaign_name
+      ORDER BY v.receita_vtex DESC NULLS LAST
+
+  # =========================================================================
+  # Shopify ↔ Google Ads — UTM-based (MEDIUM confidence)
+  # =========================================================================
+  - name: "shopify_gads_utm_campaign"
+    sources: ["shopify", "google_ads"]
+    strategy: "utm_based"
+    confidence: "medium"
+    description: "Combinar pedidos Shopify com gastos do Google Ads via utm_campaign — ROAS estimado por campanha"
+    join_approach: "Agregar Shopify por utm_campaign (filtrar utm_source = 'google'), JOIN com gastos do Google Ads por campaign_name"
+    required_conversions:
+      - "Shopify: filtrar utm_source = 'google' e utm_campaign IS NOT NULL e financial_status = 'paid'"
+      - "Shopify: filtrar dt para partition pruning"
+      - "Google Ads: metrics_cost_micros / 1000000.0 para moeda real"
+      - "Google Ads: deduplicar ads_Campaign com ROW_NUMBER antes do JOIN"
+    caveat: "Confianca media — depende de UTMs configurados nas campanhas Google Ads. has_utm = TRUE pode ser usado como filtro pre-existente no Shopify."
+    example_sql: |
+      WITH shopify_campanhas AS (
+        SELECT
+          utm_campaign,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_price), 2) AS receita_shopify
+        FROM `{project_id}.{dataset_shopify}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND financial_status = 'paid'
+          AND utm_source = 'google'
+          AND utm_campaign IS NOT NULL
+        GROUP BY utm_campaign
+      ),
+      gads_campanhas AS (
+        SELECT
+          c.campaign_name,
+          ROUND(SUM(s.metrics_cost_micros) / 1000000.0, 2) AS custo_google
+        FROM `{project_id}.{dataset_gads}.ads_CampaignStats_*` s
+        JOIN (
+          SELECT *, ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY _TABLE_SUFFIX DESC) AS rn
+          FROM `{project_id}.{dataset_gads}.ads_Campaign_*`
+        ) c ON s.campaign_id = c.campaign_id AND c.rn = 1
+        WHERE s._TABLE_SUFFIX BETWEEN '{date_start_gads}' AND '{date_end_gads}'
+        GROUP BY c.campaign_name
+      )
+      SELECT
+        COALESCE(s.utm_campaign, g.campaign_name) AS campanha,
+        s.pedidos,
+        s.receita_shopify,
+        g.custo_google,
+        ROUND(s.receita_shopify / NULLIF(g.custo_google, 0), 2) AS roas_estimado
+      FROM shopify_campanhas s
+      FULL OUTER JOIN gads_campanhas g ON s.utm_campaign = g.campaign_name
+      ORDER BY s.receita_shopify DESC NULLS LAST
+
+  # =========================================================================
+  # Shopify ↔ Meta Ads — UTM-based (MEDIUM confidence)
+  # =========================================================================
+  - name: "shopify_meta_utm_campaign"
+    sources: ["shopify", "meta_ads"]
+    strategy: "utm_based"
+    confidence: "medium"
+    description: "Combinar pedidos Shopify com gastos do Meta Ads via utm_campaign — ROAS estimado por campanha"
+    join_approach: "Agregar Shopify por utm_campaign (filtrar utm_source em facebook/instagram/meta), JOIN com gastos do Meta Ads por campaign_name"
+    required_conversions:
+      - "Shopify: filtrar utm_source IN ('facebook', 'instagram', 'meta') e utm_campaign IS NOT NULL"
+      - "Shopify: filtrar financial_status = 'paid' e dt para partition pruning"
+      - "Meta Ads: spend ja esta em moeda real — usar diretamente"
+    caveat: "Confianca media — depende de UTMs configurados nas campanhas Meta Ads. utm_source pode ser 'facebook', 'instagram' ou outro valor definido na campanha."
+    example_sql: |
+      WITH shopify_campanhas AS (
+        SELECT
+          utm_campaign,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_price), 2) AS receita_shopify
+        FROM `{project_id}.{dataset_shopify}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND financial_status = 'paid'
+          AND utm_source IN ('facebook', 'instagram', 'meta')
+          AND utm_campaign IS NOT NULL
+        GROUP BY utm_campaign
+      ),
+      meta_campanhas AS (
+        SELECT
+          campaign_name,
+          ROUND(SUM(spend), 2) AS custo_meta
+        FROM `{project_id}.{dataset_meta}.meta_ads_insights_campaign_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_meta}' AND '{date_end_meta}'
+        GROUP BY campaign_name
+      )
+      SELECT
+        COALESCE(s.utm_campaign, m.campaign_name) AS campanha,
+        s.pedidos,
+        s.receita_shopify,
+        m.custo_meta,
+        ROUND(s.receita_shopify / NULLIF(m.custo_meta, 0), 2) AS roas_estimado
+      FROM shopify_campanhas s
+      FULL OUTER JOIN meta_campanhas m ON s.utm_campaign = m.campaign_name
+      ORDER BY s.receita_shopify DESC NULLS LAST
+
+  # =========================================================================
+  # GA4 ↔ VTEX — date-based (HIGH confidence)
+  # =========================================================================
+  - name: "ga4_vtex_daily_sessions_vs_orders"
+    sources: ["ga4_bigquery", "vtex"]
+    strategy: "date_based"
+    confidence: "high"
+    description: "Combinar sessoes e usuarios do GA4 com pedidos e receita do VTEX por dia — funil de aquisicao a compra"
+    join_approach: "Agregar GA4 por data e VTEX por dt, depois JOIN por data alinhada"
+    required_conversions:
+      - "GA4 event_date (YYYYMMDD STRING) → PARSE_DATE('%Y%m%d', event_date) para DATE"
+      - "VTEX dt ja e DATE — usar diretamente"
+      - "VTEX total_value ja esta em reais — nenhuma conversao monetaria"
+    example_sql: |
+      WITH ga4_daily AS (
+        SELECT
+          PARSE_DATE('%Y%m%d', event_date) AS data,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, CAST(
+            (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING
+          ))) AS sessoes,
+          COUNT(DISTINCT user_pseudo_id) AS usuarios
+        FROM `{project_id}.{dataset_ga4}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_ga4}' AND '{date_end_ga4}'
+        GROUP BY data
+      ),
+      vtex_daily AS (
+        SELECT
+          dt AS data,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_value), 2) AS receita,
+          ROUND(AVG(total_value), 2) AS ticket_medio
+        FROM `{project_id}.{dataset_vtex}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND status = 'invoiced'
+        GROUP BY dt
+      )
+      SELECT
+        COALESCE(g.data, v.data) AS data,
+        g.sessoes,
+        g.usuarios,
+        v.pedidos,
+        v.receita,
+        v.ticket_medio,
+        -- Taxa de conversao: pedidos / sessoes
+        ROUND(v.pedidos * 100.0 / NULLIF(g.sessoes, 0), 2) AS taxa_conversao_pct
+      FROM ga4_daily g
+      FULL OUTER JOIN vtex_daily v ON g.data = v.data
+      ORDER BY data
+
+  # =========================================================================
+  # GA4 ↔ VTEX — UTM-based (MEDIUM confidence)
+  # =========================================================================
+  - name: "ga4_vtex_utm_campaign"
+    sources: ["ga4_bigquery", "vtex"]
+    strategy: "utm_based"
+    confidence: "medium"
+    description: "Combinar sessoes do GA4 com pedidos do VTEX via utm_campaign — funil por campanha"
+    join_approach: "Extrair campaign de event_params no GA4, JOIN com utm_campaign do VTEX"
+    required_conversions:
+      - "GA4: extrair campaign de event_params via UNNEST"
+      - "VTEX: filtrar dt para partition pruning"
+    caveat: "Confianca media — depende de UTMs configurados nas campanhas. GA4 captura o utm no primeiro/ultimo clique da sessao; VTEX captura no momento do pedido — pode haver divergencia."
+    example_sql: |
+      WITH ga4_campanhas AS (
+        SELECT
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign') AS utm_campaign,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, CAST(
+            (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING
+          ))) AS sessoes
+        FROM `{project_id}.{dataset_ga4}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_ga4}' AND '{date_end_ga4}'
+        GROUP BY utm_campaign
+      ),
+      vtex_campanhas AS (
+        SELECT
+          utm_campaign,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_value), 2) AS receita
+        FROM `{project_id}.{dataset_vtex}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND status = 'invoiced'
+          AND utm_campaign IS NOT NULL
+        GROUP BY utm_campaign
+      )
+      SELECT
+        COALESCE(g.utm_campaign, v.utm_campaign) AS campanha,
+        g.sessoes,
+        v.pedidos,
+        v.receita,
+        ROUND(v.pedidos * 100.0 / NULLIF(g.sessoes, 0), 2) AS taxa_conversao_pct,
+        ROUND(v.receita / NULLIF(g.sessoes, 0), 2) AS receita_por_sessao
+      FROM ga4_campanhas g
+      FULL OUTER JOIN vtex_campanhas v ON g.utm_campaign = v.utm_campaign
+      WHERE g.utm_campaign IS NOT NULL OR v.utm_campaign IS NOT NULL
+      ORDER BY v.receita DESC NULLS LAST
+
+  # =========================================================================
+  # GA4 ↔ Shopify — date-based (HIGH confidence)
+  # =========================================================================
+  - name: "ga4_shopify_daily_sessions_vs_orders"
+    sources: ["ga4_bigquery", "shopify"]
+    strategy: "date_based"
+    confidence: "high"
+    description: "Combinar sessoes e usuarios do GA4 com pedidos e receita do Shopify por dia — funil de aquisicao a compra"
+    join_approach: "Agregar GA4 por data e Shopify por dt, depois JOIN por data alinhada"
+    required_conversions:
+      - "GA4 event_date (YYYYMMDD STRING) → PARSE_DATE('%Y%m%d', event_date) para DATE"
+      - "Shopify dt ja e DATE — usar diretamente"
+      - "Shopify total_price ja esta em reais — nenhuma conversao monetaria"
+    example_sql: |
+      WITH ga4_daily AS (
+        SELECT
+          PARSE_DATE('%Y%m%d', event_date) AS data,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, CAST(
+            (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING
+          ))) AS sessoes,
+          COUNT(DISTINCT user_pseudo_id) AS usuarios
+        FROM `{project_id}.{dataset_ga4}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_ga4}' AND '{date_end_ga4}'
+        GROUP BY data
+      ),
+      shopify_daily AS (
+        SELECT
+          dt AS data,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_price), 2) AS receita,
+          ROUND(AVG(total_price), 2) AS ticket_medio
+        FROM `{project_id}.{dataset_shopify}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND financial_status = 'paid'
+        GROUP BY dt
+      )
+      SELECT
+        COALESCE(g.data, s.data) AS data,
+        g.sessoes,
+        g.usuarios,
+        s.pedidos,
+        s.receita,
+        s.ticket_medio,
+        -- Taxa de conversao: pedidos / sessoes
+        ROUND(s.pedidos * 100.0 / NULLIF(g.sessoes, 0), 2) AS taxa_conversao_pct
+      FROM ga4_daily g
+      FULL OUTER JOIN shopify_daily s ON g.data = s.data
+      ORDER BY data
+
+  # =========================================================================
+  # GA4 ↔ Shopify — UTM-based (MEDIUM confidence)
+  # =========================================================================
+  - name: "ga4_shopify_utm_campaign"
+    sources: ["ga4_bigquery", "shopify"]
+    strategy: "utm_based"
+    confidence: "medium"
+    description: "Combinar sessoes do GA4 com pedidos do Shopify via utm_campaign — funil por campanha"
+    join_approach: "Extrair campaign de event_params no GA4, JOIN com utm_campaign do Shopify"
+    required_conversions:
+      - "GA4: extrair campaign de event_params via UNNEST"
+      - "Shopify: filtrar dt e financial_status = 'paid'"
+    caveat: "Confianca media — depende de UTMs configurados. GA4 captura utm por sessao; Shopify captura de landing_site no momento do pedido. Pode haver divergencia de atribuicao."
+    example_sql: |
+      WITH ga4_campanhas AS (
+        SELECT
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign') AS utm_campaign,
+          COUNT(DISTINCT CONCAT(user_pseudo_id, CAST(
+            (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING
+          ))) AS sessoes
+        FROM `{project_id}.{dataset_ga4}.events_*`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_start_ga4}' AND '{date_end_ga4}'
+        GROUP BY utm_campaign
+      ),
+      shopify_campanhas AS (
+        SELECT
+          utm_campaign,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_price), 2) AS receita
+        FROM `{project_id}.{dataset_shopify}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND financial_status = 'paid'
+          AND utm_campaign IS NOT NULL
+        GROUP BY utm_campaign
+      )
+      SELECT
+        COALESCE(g.utm_campaign, s.utm_campaign) AS campanha,
+        g.sessoes,
+        s.pedidos,
+        s.receita,
+        ROUND(s.pedidos * 100.0 / NULLIF(g.sessoes, 0), 2) AS taxa_conversao_pct,
+        ROUND(s.receita / NULLIF(g.sessoes, 0), 2) AS receita_por_sessao
+      FROM ga4_campanhas g
+      FULL OUTER JOIN shopify_campanhas s ON g.utm_campaign = s.utm_campaign
+      WHERE g.utm_campaign IS NOT NULL OR s.utm_campaign IS NOT NULL
+      ORDER BY s.receita DESC NULLS LAST
+
+  # =========================================================================
+  # VTEX ↔ Shopify — date-based (HIGH confidence)
+  # =========================================================================
+  - name: "vtex_shopify_daily_revenue_comparison"
+    sources: ["vtex", "shopify"]
+    strategy: "date_based"
+    confidence: "high"
+    description: "Comparar receita e pedidos diarios entre VTEX e Shopify — ideal para empresas com as duas plataformas ou em migracao"
+    join_approach: "Agregar cada plataforma por dt (DATE), depois JOIN por data — ambas ja usam dt no mesmo formato"
+    required_conversions:
+      - "VTEX dt e DATE (YYYY-MM-DD) — usar diretamente"
+      - "Shopify dt e DATE (YYYY-MM-DD) — usar diretamente"
+      - "VTEX total_value ja esta em reais — nenhuma conversao"
+      - "Shopify total_price ja esta em reais — nenhuma conversao"
+    caveat: "Este join faz sentido para empresas com lojas em ambas as plataformas (ex: B2B no VTEX + D2C no Shopify) ou durante migracao de plataforma. Ambas as colunas de data e moeda ja estao alinhadas — e o cross-source join mais direto disponivel."
+    example_sql: |
+      WITH vtex_daily AS (
+        SELECT
+          dt AS data,
+          COUNT(DISTINCT order_id) AS pedidos_vtex,
+          ROUND(SUM(total_value), 2) AS receita_vtex,
+          ROUND(AVG(total_value), 2) AS ticket_medio_vtex
+        FROM `{project_id}.{dataset_vtex}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND status = 'invoiced'
+        GROUP BY dt
+      ),
+      shopify_daily AS (
+        SELECT
+          dt AS data,
+          COUNT(DISTINCT order_id) AS pedidos_shopify,
+          ROUND(SUM(total_price), 2) AS receita_shopify,
+          ROUND(AVG(total_price), 2) AS ticket_medio_shopify
+        FROM `{project_id}.{dataset_shopify}.orders_treated`
+        WHERE dt BETWEEN '{date_start}' AND '{date_end}'
+          AND financial_status = 'paid'
+        GROUP BY dt
+      )
+      SELECT
+        COALESCE(v.data, s.data) AS data,
+        COALESCE(v.pedidos_vtex, 0) AS pedidos_vtex,
+        COALESCE(v.receita_vtex, 0) AS receita_vtex,
+        COALESCE(s.pedidos_shopify, 0) AS pedidos_shopify,
+        COALESCE(s.receita_shopify, 0) AS receita_shopify,
+        -- Receita combinada das duas plataformas
+        COALESCE(v.receita_vtex, 0) + COALESCE(s.receita_shopify, 0) AS receita_total,
+        -- Participacao de cada plataforma
+        ROUND(
+          COALESCE(v.receita_vtex, 0) * 100.0
+          / NULLIF(COALESCE(v.receita_vtex, 0) + COALESCE(s.receita_shopify, 0), 0),
+          1
+        ) AS pct_receita_vtex,
+        ROUND(
+          COALESCE(s.receita_shopify, 0) * 100.0
+          / NULLIF(COALESCE(v.receita_vtex, 0) + COALESCE(s.receita_shopify, 0), 0),
+          1
+        ) AS pct_receita_shopify
+      FROM vtex_daily v
+      FULL OUTER JOIN shopify_daily s ON v.data = s.data
+      ORDER BY data

@@ -1,0 +1,254 @@
+source_name: meta_ads
+display_name: "Meta Ads — Common Queries"
+description: "Templates de consultas frequentes para dados do Meta Ads (Facebook/Instagram) no BigQuery."
+
+templates:
+  # ============================================================
+  # PERFORMANCE — CPA, ROAS, Comparativo
+  # ============================================================
+
+  - title: "CPA por Campanha"
+    category: performance
+    description: "Calcula o CPA (Custo por Aquisicao) de cada campanha, usando UNNEST para extrair purchases de actions."
+    natural_language: "Qual o CPA de cada campanha no Meta Ads?"
+    sql: |
+      -- CPA (Custo por Aquisicao) por campanha — Meta Ads
+      -- Usa UNNEST(actions) para extrair purchases e NULLIF para divisao segura
+      SELECT
+        campaign_name,
+        -- Gasto total (spend ja esta em moeda real)
+        ROUND(SUM(spend), 2) AS gasto,
+        -- Total de purchases extraido de actions via UNNEST
+        SUM(
+          (SELECT COALESCE(SUM(a.value), 0) FROM UNNEST(actions) a WHERE a.action_type = 'purchase')
+        ) AS compras,
+        -- CPA = gasto / compras (com NULLIF para evitar divisao por zero)
+        ROUND(
+          SUM(spend)
+          / NULLIF(
+            SUM(
+              (SELECT COALESCE(SUM(a.value), 0) FROM UNNEST(actions) a WHERE a.action_type = 'purchase')
+            ),
+            0
+          ),
+          2
+        ) AS cpa
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY campaign_name
+      ORDER BY gasto DESC
+    explanation: >
+      Esta consulta mostra o Custo por Aquisicao (CPA) de cada campanha do Meta Ads.
+      O CPA e calculado dividindo o gasto total pelo numero de purchases. O campo spend
+      do Meta ja vem em moeda real (nao precisa converter). Campanhas sem compras aparecem
+      com CPA nulo ao inves de erro. As conversoes sao extraidas do campo actions (ARRAY)
+      usando UNNEST.
+
+  - title: "ROAS por Campanha"
+    category: performance
+    description: "Calcula o ROAS (Return on Ad Spend) usando action_values para obter o valor monetario das conversoes."
+    natural_language: "Qual o ROAS de cada campanha?"
+    sql: |
+      -- ROAS (Return on Ad Spend) por campanha — Meta Ads
+      -- Usa UNNEST(action_values) para valor de purchases e NULLIF no denominador
+      SELECT
+        campaign_name,
+        -- Gasto total
+        ROUND(SUM(spend), 2) AS gasto,
+        -- Valor total de purchases extraido de action_values
+        ROUND(
+          SUM(
+            (SELECT COALESCE(SUM(av.value), 0) FROM UNNEST(action_values) av WHERE av.action_type = 'purchase')
+          ),
+          2
+        ) AS valor_compras,
+        -- ROAS = valor de conversoes / gasto (com NULLIF)
+        ROUND(
+          SUM(
+            (SELECT COALESCE(SUM(av.value), 0) FROM UNNEST(action_values) av WHERE av.action_type = 'purchase')
+          )
+          / NULLIF(SUM(spend), 0),
+          2
+        ) AS roas
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY campaign_name
+      ORDER BY roas DESC
+    explanation: >
+      Esta consulta mostra o ROAS (Return on Ad Spend) de cada campanha. O ROAS indica
+      quantos reais de receita foram gerados para cada real investido. Um ROAS de 5.0
+      significa que para cada R$1 gasto, R$5 retornaram em vendas. O valor monetario
+      das conversoes e extraido de action_values (ARRAY) usando UNNEST.
+
+  - title: "Comparativo de Campanhas"
+    category: performance
+    description: "Visao geral de todas as campanhas com gasto, impressoes, cliques no link, alcance e conversoes."
+    natural_language: "Como estao performando minhas campanhas no Meta?"
+    sql: |
+      -- Comparativo de performance de campanhas — Meta Ads
+      -- Usa link_clicks (nao clicks) para CTR real de trafego
+      SELECT
+        campaign_name,
+        objective,
+        ROUND(SUM(spend), 2) AS gasto,
+        SUM(impressions) AS impressoes,
+        SUM(reach) AS alcance,
+        SUM(link_clicks) AS cliques_no_link,
+        -- CTR de link com NULLIF
+        ROUND(
+          SUM(link_clicks) * 100.0
+          / NULLIF(SUM(impressions), 0),
+          2
+        ) AS ctr_link_pct,
+        -- Conversoes (purchases)
+        SUM(
+          (SELECT COALESCE(SUM(a.value), 0) FROM UNNEST(actions) a WHERE a.action_type = 'purchase')
+        ) AS compras
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY campaign_name, objective
+      ORDER BY gasto DESC
+    explanation: >
+      Esta consulta oferece uma visao completa de todas as campanhas Meta Ads. Para cada
+      campanha, mostra o objetivo, gasto, impressoes, alcance unico, cliques no link (nao
+      inclui curtidas/comentarios), CTR de link e total de compras. Util para comparar
+      performance entre campanhas com diferentes objetivos.
+
+  # ============================================================
+  # BUDGET — Tendencia de gasto
+  # ============================================================
+
+  - title: "Tendencia de Gasto Diario"
+    category: budget
+    description: "Mostra a evolucao do gasto diario com impressoes, alcance e cliques no link."
+    natural_language: "Como esta a tendencia de gasto diario no Meta Ads?"
+    sql: |
+      -- Tendencia de gasto diario — Meta Ads
+      -- Usa date_start para agrupamento e _TABLE_SUFFIX para filtro eficiente
+      SELECT
+        date_start,
+        -- Gasto diario (spend ja em moeda real)
+        ROUND(SUM(spend), 2) AS gasto,
+        -- Volume
+        SUM(impressions) AS impressoes,
+        SUM(reach) AS alcance,
+        SUM(link_clicks) AS cliques_no_link,
+        -- CTR de link com NULLIF
+        ROUND(
+          SUM(link_clicks) * 100.0
+          / NULLIF(SUM(impressions), 0),
+          2
+        ) AS ctr_link_pct
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY date_start
+      ORDER BY date_start
+    explanation: >
+      Esta consulta mostra como seu investimento diario no Meta Ads evoluiu ao longo
+      do periodo. Para cada dia, exibe o gasto total, impressoes, alcance unico,
+      cliques no link e CTR. Util para identificar picos de gasto, dias sem investimento
+      e tendencias de performance ao longo do tempo.
+
+  - title: "Gasto Mensal por Campanha"
+    category: budget
+    description: "Agrega o gasto por mes e campanha para acompanhar evolucao do investimento."
+    natural_language: "Qual o gasto mensal por campanha no Meta?"
+    sql: |
+      -- Gasto mensal por campanha — Meta Ads
+      -- Usa SUBSTR de date_start (YYYY-MM-DD) para agrupar por mes
+      SELECT
+        SUBSTR(date_start, 1, 7) AS mes,
+        campaign_name,
+        ROUND(SUM(spend), 2) AS gasto,
+        SUM(impressions) AS impressoes,
+        SUM(link_clicks) AS cliques_no_link
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY mes, campaign_name
+      ORDER BY mes, gasto DESC
+    explanation: >
+      Esta consulta mostra o gasto mensal de cada campanha do Meta Ads. Agrupa
+      por mes (YYYY-MM) e campanha, permitindo acompanhar a evolucao do investimento.
+      Inclui impressoes e cliques no link para contexto de volume.
+
+  # ============================================================
+  # ALCANCE — Reach e Frequency
+  # ============================================================
+
+  - title: "Top Campanhas por Alcance"
+    category: alcance
+    description: "Ranking de campanhas por alcance unico (reach), com frequencia e CPM."
+    natural_language: "Quais campanhas tem maior alcance?"
+    sql: |
+      -- Top campanhas por alcance unico — Meta Ads
+      -- reach = pessoas unicas, impressions = total de exibicoes
+      SELECT
+        campaign_name,
+        objective,
+        SUM(reach) AS alcance_unico,
+        SUM(impressions) AS impressoes_totais,
+        -- Frequencia media (impressions / reach)
+        ROUND(SUM(impressions) * 1.0 / NULLIF(SUM(reach), 0), 2) AS frequencia_media,
+        -- CPM (custo por mil impressoes)
+        ROUND(SUM(spend) * 1000.0 / NULLIF(SUM(impressions), 0), 2) AS cpm,
+        ROUND(SUM(spend), 2) AS gasto
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY campaign_name, objective
+      ORDER BY alcance_unico DESC
+    explanation: >
+      Esta consulta mostra as campanhas com maior alcance unico (pessoas diferentes que
+      viram o anuncio). Inclui frequencia media (quantas vezes cada pessoa viu) e CPM.
+      Campanhas de awareness tendem a ter maior alcance e menor frequencia, enquanto
+      campanhas de conversao podem ter alcance menor com frequencia mais alta.
+
+  - title: "Frequencia Media por Campanha"
+    category: alcance
+    description: "Mostra a frequencia media (vezes que cada pessoa viu o anuncio) por campanha."
+    natural_language: "Qual a frequencia media dos anuncios por campanha?"
+    sql: |
+      -- Frequencia media por campanha — Meta Ads
+      -- Frequencia = impressions / reach (alta frequencia pode causar fadiga)
+      SELECT
+        campaign_name,
+        SUM(impressions) AS impressoes,
+        SUM(reach) AS alcance,
+        ROUND(SUM(impressions) * 1.0 / NULLIF(SUM(reach), 0), 2) AS frequencia_media,
+        ROUND(SUM(spend), 2) AS gasto
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY campaign_name
+      ORDER BY frequencia_media DESC
+    explanation: >
+      Esta consulta mostra quantas vezes, em media, cada pessoa viu os anuncios de cada
+      campanha. Frequencia muito alta (acima de 3-4) pode indicar fadiga do publico e
+      queda de performance. Frequencia muito baixa pode significar que o publico nao esta
+      sendo impactado o suficiente para converter. O ideal depende do objetivo da campanha.
+
+  # ============================================================
+  # CONVERSOES — Detalhamento por tipo
+  # ============================================================
+
+  - title: "Conversoes por Tipo de Acao"
+    category: conversoes
+    description: "Lista todas as acoes registradas (purchases, leads, link_clicks, etc.) usando CROSS JOIN UNNEST."
+    natural_language: "Quais tipos de conversao estao acontecendo nas minhas campanhas?"
+    sql: |
+      -- Conversoes por tipo de acao — Meta Ads
+      -- CROSS JOIN UNNEST(actions) para expandir o ARRAY de acoes
+      SELECT
+        campaign_name,
+        a.action_type AS tipo_acao,
+        ROUND(SUM(a.value), 0) AS total_acoes,
+        ROUND(SUM(spend), 2) AS gasto_campanha
+      FROM `{project_id}.{dataset}.meta_ads_insights_campaign_*`,
+        UNNEST(actions) AS a
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY campaign_name, a.action_type
+      ORDER BY campaign_name, total_acoes DESC
+    explanation: >
+      Esta consulta detalha todos os tipos de conversao registrados por campanha.
+      O Meta rastreia diversas acoes (purchases, leads, link_clicks, page_views, etc.)
+      e todas ficam no campo actions como ARRAY. Aqui usamos UNNEST para expandir
+      cada tipo de acao em uma linha separada, facilitando a analise de quais acoes
+      cada campanha esta gerando.

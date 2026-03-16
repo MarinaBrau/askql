@@ -1,0 +1,388 @@
+source_name: shopify
+display_name: "Shopify (E-commerce)"
+description: >
+  Dados de e-commerce Shopify exportados para BigQuery via pipeline ELT customizado.
+  As tabelas ficam no dataset shopify_treated e sao views deduplicadas (ROW_NUMBER
+  ja aplicado no pipeline — NAO repetir dedup nas queries). Todos os valores
+  monetarios (total_price, price, line_total, etc.) ja estao em moeda real (FLOAT).
+  PII de clientes e pedidos ja esta mascarado nas views (email_masked, first_name_masked).
+  Particionamento por coluna `dt` (DATE) — sempre filtrar por `dt` para performance.
+  Campos derivados (order_date, has_coupon, is_on_sale, customer_segment, etc.)
+  ja sao calculados pelo pipeline — nao recalcular nas queries.
+
+tables:
+  # ── Pedidos ──────────────────────────────────────────────────────────────
+
+  - name: "orders_treated"
+    description: >
+      Pedidos Shopify deduplicados com UTMs, informacoes de entrega, cupons e
+      campos derivados (order_date, has_coupon, has_discount, has_utm).
+      PII de cliente ja mascarado (email_masked, first_name_masked, last_name_masked).
+      View deduplicada por order_id — cada pedido aparece uma unica vez.
+      Particionada por dt (DATE derivada de created_at).
+    primary_key: order_id
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: order_id
+        type: STRING
+        description: "ID unico do pedido (chave primaria). Ex: '6123456789012'"
+      - name: order_number
+        type: INTEGER
+        description: "Numero sequencial do pedido na loja. Ex: 1001, 1002."
+      - name: name
+        type: STRING
+        description: "Nome do pedido com prefixo. Ex: '#1001'. Util para exibicao."
+      - name: created_at
+        type: TIMESTAMP
+        description: "Timestamp de criacao do pedido (TIMESTAMP, nao STRING). Usar DATE(created_at) para converter para data. Preferir dt para filtros de performance."
+      - name: updated_at
+        type: TIMESTAMP
+        description: "Timestamp da ultima atualizacao do pedido."
+      - name: processed_at
+        type: TIMESTAMP
+        description: "Timestamp de processamento do pedido."
+      - name: closed_at
+        type: TIMESTAMP
+        description: "Timestamp de fechamento do pedido. NULL se ainda aberto."
+      - name: cancelled_at
+        type: TIMESTAMP
+        description: "Timestamp de cancelamento. NULL se nao cancelado."
+      - name: financial_status
+        type: STRING
+        description: "Status financeiro: paid, pending, authorized, refunded, voided, partially_refunded, partially_paid."
+      - name: fulfillment_status
+        type: STRING
+        description: "Status de entrega: fulfilled, partial, NULL (nao enviado), restocked."
+      - name: cancel_reason
+        type: STRING
+        description: "Motivo do cancelamento: customer, fraud, inventory, declined, other. NULL se nao cancelado."
+      - name: total_price
+        type: FLOAT64
+        description: "Valor total do pedido em moeda real, incluindo impostos e frete. NAO dividir."
+      - name: subtotal_price
+        type: FLOAT64
+        description: "Subtotal antes de impostos e frete em moeda real."
+      - name: total_tax
+        type: FLOAT64
+        description: "Total de impostos em moeda real."
+      - name: total_discounts
+        type: FLOAT64
+        description: "Total de descontos aplicados em moeda real."
+      - name: total_shipping_price_set
+        type: FLOAT64
+        description: "Valor total do frete em moeda real."
+      - name: currency
+        type: STRING
+        description: "Codigo da moeda. Ex: 'BRL', 'USD'."
+      - name: customer_id
+        type: STRING
+        description: "ID do cliente. FK para customers_treated.customer_id. Pode ser NULL para pedidos guest."
+      - name: customer_email_masked
+        type: STRING
+        description: "Email mascarado do cliente (PII). Ex: 'ma***@gmail.com'. Nao contem email completo."
+      - name: customer_first_name_masked
+        type: STRING
+        description: "Primeiro nome mascarado. Ex: 'M***'. Nao contem nome completo."
+      - name: customer_last_name_masked
+        type: STRING
+        description: "Sobrenome mascarado. Ex: 'S***'. Nao contem sobrenome completo."
+      - name: tags
+        type: "ARRAY<STRING>"
+        description: "Tags do pedido como array de strings. Requer UNNEST para filtrar ou explodir. Ex: ['vip', 'atacado']."
+      - name: source_name
+        type: STRING
+        description: "Origem do pedido: web, pos, api, mobile_app, etc."
+      - name: referring_site
+        type: STRING
+        description: "URL do site de referencia. Ex: 'https://google.com'."
+      - name: landing_site
+        type: STRING
+        description: "URL da pagina de entrada (com UTM parameters). Fonte dos campos utm_*."
+      - name: utm_source
+        type: STRING
+        description: "Fonte UTM extraida de landing_site. Ex: google, facebook, instagram. NULL se sem UTM."
+      - name: utm_campaign
+        type: STRING
+        description: "Campanha UTM extraida de landing_site. NULL se sem UTM."
+      - name: utm_medium
+        type: STRING
+        description: "Medium UTM extraida de landing_site. Ex: cpc, social, email. NULL se sem UTM."
+      - name: coupon_code
+        type: STRING
+        description: "Primeiro cupom aplicado ao pedido. NULL se sem cupom. Para todos os cupons, usar discount_codes."
+      - name: discount_codes
+        type: STRING
+        description: "JSON string com array de todos os codigos de desconto aplicados. Para multiplos cupons, usar JSON_EXTRACT_ARRAY() + UNNEST."
+      - name: shipping_company
+        type: STRING
+        description: "Transportadora/carrier. Ex: 'Correios', 'DHL'."
+      - name: shipping_method
+        type: STRING
+        description: "Nome do metodo de entrega. Ex: 'PAC', 'SEDEX'."
+      - name: shipping_code
+        type: STRING
+        description: "Codigo do metodo de entrega."
+      - name: shipping_price
+        type: FLOAT64
+        description: "Preco do frete em moeda real."
+      - name: order_date
+        type: DATE
+        description: "Campo derivado: DATE(created_at). Ja calculado pelo pipeline — usar diretamente."
+      - name: order_day_of_week
+        type: STRING
+        description: "Campo derivado: dia da semana em ingles. Ex: 'Monday', 'Friday'."
+      - name: order_hour
+        type: INTEGER
+        description: "Campo derivado: hora do pedido (0-23)."
+      - name: order_month
+        type: INTEGER
+        description: "Campo derivado: mes do pedido (1-12)."
+      - name: order_year
+        type: INTEGER
+        description: "Campo derivado: ano do pedido."
+      - name: has_coupon
+        type: BOOLEAN
+        description: "Campo derivado: TRUE se coupon_code IS NOT NULL."
+      - name: has_discount
+        type: BOOLEAN
+        description: "Campo derivado: TRUE se total_discounts > 0."
+      - name: has_utm
+        type: BOOLEAN
+        description: "Campo derivado: TRUE se utm_source IS NOT NULL."
+      - name: dt
+        type: DATE
+        description: "Data de particao (derivada de created_at). SEMPRE usar dt para filtros de data — proporciona performance maxima no BigQuery."
+
+  # ── Itens dos pedidos ─────────────────────────────────────────────────────
+
+  - name: "order_items_treated"
+    description: >
+      Itens de pedidos Shopify deduplicados com campos derivados.
+      Cada linha = 1 produto (variant) em 1 pedido.
+      has_discount e discount_percentage ja calculados pelo pipeline.
+      FK para orders_treated (order_id) e products_treated (product_id).
+    primary_key: ["order_id", "item_id"]
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: order_id
+        type: STRING
+        description: "ID do pedido pai. FK para orders_treated.order_id."
+      - name: item_id
+        type: STRING
+        description: "ID unico do item dentro do pedido."
+      - name: product_id
+        type: STRING
+        description: "ID do produto. FK para products_treated.product_id. Pode ser NULL para produtos deletados."
+      - name: variant_id
+        type: STRING
+        description: "ID da variante especifica do produto (cor, tamanho, etc.)."
+      - name: name
+        type: STRING
+        description: "Nome do produto no momento da compra."
+      - name: sku
+        type: STRING
+        description: "SKU (Stock Keeping Unit) do item."
+      - name: vendor
+        type: STRING
+        description: "Fornecedor/fabricante do produto."
+      - name: title
+        type: STRING
+        description: "Titulo da variante do produto. Ex: 'Azul / G'."
+      - name: quantity
+        type: INTEGER
+        description: "Quantidade comprada."
+      - name: price
+        type: FLOAT64
+        description: "Preco unitario do item em moeda real."
+      - name: total_discount
+        type: FLOAT64
+        description: "Desconto total aplicado a este item em moeda real."
+      - name: line_total
+        type: FLOAT64
+        description: "Total do item: price * quantity - total_discount. Em moeda real."
+      - name: has_discount
+        type: BOOLEAN
+        description: "Campo derivado: TRUE se total_discount > 0."
+      - name: discount_percentage
+        type: FLOAT64
+        description: "Campo derivado: percentual de desconto = total_discount / (price * quantity). NULL se sem desconto."
+      - name: dt
+        type: DATE
+        description: "Data de particao (mesma do pedido pai). SEMPRE usar dt para filtros."
+
+  # ── Produtos ──────────────────────────────────────────────────────────────
+
+  - name: "products_treated"
+    description: >
+      Catalogo de produtos Shopify deduplicados com campos derivados.
+      is_on_sale, stock_level, discount_percentage e has_stock ja calculados.
+      Cada product_id aparece uma unica vez (dados mais recentes).
+      Particionada por dt (data de sincronizacao do catalogo).
+    primary_key: product_id
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: product_id
+        type: STRING
+        description: "ID unico do produto (chave primaria)."
+      - name: title
+        type: STRING
+        description: "Titulo/nome do produto."
+      - name: handle
+        type: STRING
+        description: "Handle URL-friendly do produto. Ex: 'camiseta-azul-g'. Unico na loja."
+      - name: vendor
+        type: STRING
+        description: "Fornecedor/fabricante do produto."
+      - name: product_type
+        type: STRING
+        description: "Tipo/categoria do produto definido na loja. Ex: 'Calcados', 'Vestuario'. Equivalente a categoria."
+      - name: status
+        type: STRING
+        description: "Status do produto: active (visivel), archived (arquivado), draft (rascunho)."
+      - name: created_at
+        type: TIMESTAMP
+        description: "Timestamp de criacao do produto."
+      - name: updated_at
+        type: TIMESTAMP
+        description: "Timestamp da ultima atualizacao."
+      - name: published_at
+        type: TIMESTAMP
+        description: "Timestamp de publicacao. NULL se nao publicado."
+      - name: tags
+        type: "ARRAY<STRING>"
+        description: "Tags do produto como array de strings. Requer UNNEST para filtrar individualmente."
+      - name: price
+        type: FLOAT64
+        description: "Preco de venda da primeira variante em moeda real."
+      - name: compare_at_price
+        type: FLOAT64
+        description: "Preco 'de' (original antes do desconto) da primeira variante. NULL se nao em promocao."
+      - name: discount_percentage
+        type: FLOAT64
+        description: "Campo derivado: percentual de desconto = (compare_at_price - price) / compare_at_price * 100. NULL se sem compare_at_price."
+      - name: is_on_sale
+        type: BOOLEAN
+        description: "Campo derivado: TRUE se compare_at_price > price (produto em promocao)."
+      - name: sku
+        type: STRING
+        description: "SKU da primeira variante."
+      - name: inventory_quantity
+        type: INTEGER
+        description: "Quantidade em estoque da primeira variante."
+      - name: has_stock
+        type: BOOLEAN
+        description: "Campo derivado: TRUE se inventory_quantity > 0."
+      - name: stock_level
+        type: STRING
+        description: "Campo derivado: 'out_of_stock' (0), 'low_stock' (1-5), 'medium_stock' (6-20), 'high_stock' (>20), 'unknown' (NULL)."
+      - name: image_url
+        type: STRING
+        description: "URL da primeira imagem do produto."
+      - name: variants_count
+        type: INTEGER
+        description: "Numero de variantes do produto."
+      - name: images_count
+        type: INTEGER
+        description: "Numero de imagens do produto."
+      - name: created_date
+        type: DATE
+        description: "Campo derivado: DATE(created_at)."
+      - name: days_since_created
+        type: INTEGER
+        description: "Campo derivado: dias desde a criacao do produto."
+      - name: days_since_published
+        type: INTEGER
+        description: "Campo derivado: dias desde a publicacao. NULL se nao publicado."
+      - name: dt
+        type: DATE
+        description: "Data de particao (sincronizacao do catalogo). Para estado atual usar MAX(dt)."
+
+  # ── Clientes ──────────────────────────────────────────────────────────────
+
+  - name: "customers_treated"
+    description: >
+      Clientes Shopify deduplicados com PII mascarado e campos de segmentacao.
+      customer_segment (by valor), frequency_segment (by frequencia) e avg_order_value
+      ja calculados pelo pipeline. Dados de localizacao disponiveis (city, state, country).
+      Cada customer_id aparece uma unica vez (dados mais recentes).
+    primary_key: customer_id
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: customer_id
+        type: STRING
+        description: "ID unico do cliente (chave primaria). FK de orders_treated.customer_id."
+      - name: email_masked
+        type: STRING
+        description: "Email mascarado (PII). Ex: 'ma***@gmail.com'. Nao contem email completo."
+      - name: first_name_masked
+        type: STRING
+        description: "Primeiro nome mascarado. Ex: 'M***'."
+      - name: last_name_masked
+        type: STRING
+        description: "Sobrenome mascarado. Ex: 'S***'."
+      - name: phone_masked
+        type: STRING
+        description: "Telefone mascarado. Ex: '+5***11'. Nao contem numero completo."
+      - name: verified_email
+        type: BOOLEAN
+        description: "TRUE se o email do cliente foi verificado."
+      - name: accepts_marketing
+        type: BOOLEAN
+        description: "TRUE se o cliente aceita emails de marketing."
+      - name: marketing_opt_in_level
+        type: STRING
+        description: "Nivel de consentimento de marketing: single_opt_in, confirmed_opt_in, unknown."
+      - name: orders_count
+        type: INTEGER
+        description: "Total de pedidos feitos pelo cliente (calculado pelo Shopify)."
+      - name: total_spent
+        type: FLOAT64
+        description: "Total gasto pelo cliente em moeda real (calculado pelo Shopify)."
+      - name: currency
+        type: STRING
+        description: "Moeda do cliente."
+      - name: avg_order_value
+        type: FLOAT64
+        description: "Campo derivado: total_spent / orders_count. Valor medio por pedido."
+      - name: customer_segment
+        type: STRING
+        description: "Campo derivado por valor gasto: 'no_purchase' (0), 'low_value' (<100), 'medium_value' (100-499), 'high_value' (500-999), 'vip' (>=1000)."
+      - name: frequency_segment
+        type: STRING
+        description: "Campo derivado por frequencia: 'no_orders' (0), 'one_time' (1), 'occasional' (2-3), 'regular' (4-10), 'frequent' (>10)."
+      - name: created_at
+        type: TIMESTAMP
+        description: "Timestamp de criacao do cliente (cadastro na loja)."
+      - name: updated_at
+        type: TIMESTAMP
+        description: "Timestamp da ultima atualizacao do cliente."
+      - name: signup_date
+        type: DATE
+        description: "Campo derivado: DATE(created_at). Data de cadastro."
+      - name: days_since_signup
+        type: INTEGER
+        description: "Campo derivado: dias desde o cadastro."
+      - name: days_since_last_activity
+        type: INTEGER
+        description: "Campo derivado: dias desde a ultima atualizacao."
+      - name: tags
+        type: "ARRAY<STRING>"
+        description: "Tags do cliente como array de strings. Requer UNNEST para filtrar."
+      - name: state
+        type: STRING
+        description: "Estado/provincia do endereco padrao."
+      - name: state_code
+        type: STRING
+        description: "Codigo do estado. Ex: 'SP', 'RJ'."
+      - name: city
+        type: STRING
+        description: "Cidade do endereco padrao."
+      - name: country
+        type: STRING
+        description: "Pais do endereco padrao."
+      - name: country_code
+        type: STRING
+        description: "Codigo do pais. Ex: 'BR', 'US'."
+      - name: dt
+        type: DATE
+        description: "Data de particao. Para estado atual usar MAX(dt)."

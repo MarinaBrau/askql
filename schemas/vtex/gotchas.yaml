@@ -1,0 +1,165 @@
+source_name: vtex
+description: >
+  Gotchas criticos para gerar SQL correto sobre tabelas do VTEX no BigQuery.
+  Dataset: vtex_treated. Todas as tabelas sao views deduplicadas.
+
+gotchas:
+  - id: 1
+    title: "Precos ja estao em REAIS (NAO dividir por 100)"
+    severity: critical
+    description: >
+      O pipeline ETL converte todos os valores monetarios da VTEX de centavos
+      para reais antes de gravar no BigQuery. Os campos total_value, price,
+      selling_price, total, shipping_price, list_price, base_price e cost_price
+      ja estao em REAIS. Se voce dividir por 100 (habito de quem trabalha com
+      APIs que retornam centavos), os valores ficarao 100x menores — erro
+      catastrofico em relatorios de receita.
+    correct_example: |
+      -- Receita total ja em reais — usar diretamente
+      SELECT
+        DATE(creation_date) AS data,
+        ROUND(SUM(total_value), 2) AS receita
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND status = 'invoiced'
+      GROUP BY data
+      ORDER BY data
+    incorrect_example: |
+      -- ERRADO: dividindo por 100 (valores ficam 100x menores!)
+      SELECT
+        ROUND(SUM(total_value) / 100, 2) AS receita
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+
+  - id: 2
+    title: "Usar dt para filtros de data (nao DATE(creation_date))"
+    severity: critical
+    description: >
+      A tabela orders_treated e particionada pela coluna dt (DATE, no formato
+      YYYY-MM-DD derivada de creation_date pelo pipeline). Para filtrar por
+      periodo, use SEMPRE dt — isso aciona o partition pruning do BigQuery,
+      reduzindo drasticamente o volume de dados escaneados e o custo.
+      Usar DATE(creation_date) sem filtrar dt funciona, mas escaneia
+      todas as particoes (caro e lento).
+    correct_example: |
+      -- Filtro correto usando dt (ativa partition pruning)
+      SELECT order_id, status, total_value
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+    incorrect_example: |
+      -- ERRADO: sem filtro de dt — escaneia TODAS as particoes (custo alto!)
+      SELECT order_id, status, total_value
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE DATE(creation_date) BETWEEN '2026-01-01' AND '2026-01-31'
+
+  - id: 3
+    title: "applied_promotions e JSON string — requer JSON_EXTRACT_ARRAY para UNNEST"
+    severity: high
+    description: >
+      O campo applied_promotions em orders_treated e uma STRING contendo um
+      JSON array de objetos de promocao. Para acessar os dados individuais
+      de cada promocao, voce deve usar JSON_EXTRACT_ARRAY() para converter a
+      string em array e depois fazer UNNEST. NAO tente acessar como campo
+      direto ou usar JSON_VALUE sem o UNNEST.
+    correct_example: |
+      -- Extrair promocoes aplicadas usando JSON_EXTRACT_ARRAY + UNNEST
+      SELECT
+        o.order_id,
+        o.total_value,
+        JSON_VALUE(promo, '$.name') AS nome_promocao,
+        JSON_VALUE(promo, '$.promotionId') AS id_promocao
+      FROM `{project_id}.{dataset}.orders_treated` o,
+        UNNEST(JSON_EXTRACT_ARRAY(o.applied_promotions)) AS promo
+      WHERE o.dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND o.applied_promotions IS NOT NULL
+        AND o.applied_promotions != '[]'
+    incorrect_example: |
+      -- ERRADO: acessando applied_promotions como campo estruturado diretamente
+      SELECT order_id, applied_promotions.name
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+
+  - id: 4
+    title: "creation_date e ISO 8601 — usar DATE(creation_date) para converter"
+    severity: high
+    description: >
+      O campo creation_date em orders_treated e uma STRING no formato ISO 8601
+      (ex: '2026-01-15T14:32:00Z'). Se precisar comparar ou agrupar por data,
+      use DATE(creation_date) para converter para DATE. Porem, prefira sempre
+      filtrar por dt (campo de particao) em vez de DATE(creation_date) para
+      melhor performance.
+    correct_example: |
+      -- Agrupar por data usando DATE(creation_date) para exibicao
+      -- Mas filtrar por dt para performance
+      SELECT
+        DATE(creation_date) AS data_pedido,
+        COUNT(*) AS pedidos
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+      GROUP BY data_pedido
+      ORDER BY data_pedido
+    incorrect_example: |
+      -- ERRADO: comparar STRING ISO 8601 diretamente com uma data
+      SELECT *
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE creation_date = '2026-01-15'
+
+  - id: 5
+    title: "Dedup ja feito — NAO repetir ROW_NUMBER nas queries"
+    severity: high
+    description: >
+      Todas as tabelas no dataset vtex_treated sao views que ja aplicam
+      ROW_NUMBER() OVER (PARTITION BY ... ORDER BY ...) para deduplicar
+      registros. Nao e necessario (nem correto) adicionar deduplicacao
+      manual nas suas queries. Fazer dedup desnecessario aumenta o custo
+      computacional e pode introduzir bugs sutis.
+    correct_example: |
+      -- Correto: consultar orders_treated diretamente (ja deduplicado)
+      SELECT order_id, status, total_value
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+    incorrect_example: |
+      -- ERRADO: aplicando ROW_NUMBER desnecessario (ja feito pelo pipeline)
+      WITH dedup AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY creation_date DESC) AS rn
+        FROM `{project_id}.{dataset}.orders_treated`
+        WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+      )
+      SELECT * FROM dedup WHERE rn = 1
+
+  - id: 6
+    title: "Cross-source com midia via UTM — confianca media"
+    severity: medium
+    description: >
+      Para combinar dados VTEX com Google Ads ou Meta Ads, o JOIN e feito por
+      utm_campaign (campo em orders_treated) com o nome da campanha nas fontes
+      de midia. Essa ligacao tem CONFIANCA MEDIA porque: (1) o UTM capturado
+      na compra pode ser o ultimo clique, nao necessariamente o mesmo nome da
+      campanha na plataforma de midia; (2) pedidos sem UTM tem campo NULL.
+      Sempre usar LEFT JOIN e NULLIF para evitar erros com NULLs.
+    correct_example: |
+      -- VTEX + Google Ads via utm_campaign (confianca media — LEFT JOIN)
+      WITH vtex_por_campanha AS (
+        SELECT
+          utm_campaign,
+          COUNT(DISTINCT order_id) AS pedidos,
+          ROUND(SUM(total_value), 2) AS receita
+        FROM `{project_id}.{dataset_vtex}.orders_treated`
+        WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+          AND utm_source = 'google'
+          AND utm_campaign IS NOT NULL
+        GROUP BY utm_campaign
+      )
+      SELECT
+        v.utm_campaign,
+        v.pedidos,
+        v.receita,
+        ROUND(v.receita / NULLIF(v.pedidos, 0), 2) AS ticket_medio
+      FROM vtex_por_campanha v
+      ORDER BY v.receita DESC
+    incorrect_example: |
+      -- CUIDADO: INNER JOIN exclui pedidos sem UTM e campanhas sem pedidos
+      -- Preferir LEFT JOIN ou FULL OUTER JOIN para visao completa
+      SELECT v.*, g.*
+      FROM vtex_por_campanha v
+      INNER JOIN google_ads_campanhas g ON v.utm_campaign = g.campaign_name

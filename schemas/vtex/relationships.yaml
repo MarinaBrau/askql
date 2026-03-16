@@ -1,0 +1,119 @@
+source_name: vtex
+description: >
+  Relacionamentos entre tabelas do dataset vtex_treated no BigQuery.
+  IMPORTANTE: Todas as tabelas sao views deduplicadas (ROW_NUMBER ja aplicado
+  pelo pipeline ETL). NAO adicionar ROW_NUMBER ou deduplicacao nas queries.
+  Particionar sempre por dt (DATE) para performance.
+
+relationships:
+  # =========================================================================
+  # orders_treated → order_items_treated (1:N)
+  # =========================================================================
+  - name: "orders_to_items"
+    from_table: "orders_treated"
+    to_table: "order_items_treated"
+    join_key: "order_id"
+    join_key_to: "order_id"
+    cardinality: "1:N"
+    requires_dedup: false
+    useful_fields: [item_id, product_id, name, quantity, price, selling_price, total, brand_name]
+    gotcha: "Ambas as tabelas sao views deduplicadas. Nao adicionar ROW_NUMBER. Filtrar dt em ambas as tabelas para performance."
+    example_sql: |
+      -- Itens de um pedido especifico
+      SELECT
+        o.order_id,
+        o.status,
+        o.total_value,
+        i.name AS produto,
+        i.quantity,
+        i.selling_price,
+        i.total AS total_item
+      FROM `{project_id}.{dataset}.orders_treated` o
+      JOIN `{project_id}.{dataset}.order_items_treated` i ON o.order_id = i.order_id
+      WHERE o.dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND i.dt BETWEEN '2026-01-01' AND '2026-01-31'
+      ORDER BY o.order_id, i.name
+
+  # =========================================================================
+  # order_items_treated → catalog_treated (N:1)
+  # =========================================================================
+  - name: "items_to_catalog"
+    from_table: "order_items_treated"
+    to_table: "catalog_treated"
+    join_key: "product_id"
+    join_key_to: "product_id"
+    cardinality: "N:1"
+    requires_dedup: false
+    useful_fields: [product_name, brand_name, category_id, list_price, base_price, cost_price, price_markup_pct, has_stock]
+    gotcha: "catalog_treated e uma view deduplicada. Pode haver multiplos SKUs (sku_id) por product_id — o JOIN por product_id retorna apenas 1 linha por produto se usar DISTINCT ou agregar. Filtrar dt do catalogo com a data mais recente disponivel."
+    example_sql: |
+      -- Top produtos por receita com informacoes do catalogo
+      SELECT
+        c.product_name,
+        c.brand_name,
+        SUM(i.quantity) AS unidades_vendidas,
+        ROUND(SUM(i.total), 2) AS receita,
+        ROUND(AVG(c.price_markup_pct), 1) AS markup_medio_pct
+      FROM `{project_id}.{dataset}.order_items_treated` i
+      JOIN `{project_id}.{dataset}.catalog_treated` c ON i.product_id = c.product_id
+      WHERE i.dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND c.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.catalog_treated`)
+      GROUP BY c.product_name, c.brand_name
+      ORDER BY receita DESC
+      LIMIT 10
+
+  # =========================================================================
+  # orders_treated → coupons_treated (N:1)
+  # =========================================================================
+  - name: "orders_to_coupons"
+    from_table: "orders_treated"
+    to_table: "coupons_treated"
+    join_key: "coupon_code"
+    join_key_to: "coupon_code"
+    cardinality: "N:1"
+    requires_dedup: false
+    useful_fields: [utm_source, utm_campaign, coupon_status, expiration_date_utc]
+    gotcha: "Muitos pedidos nao tem cupom (coupon_code NULL em orders_treated). Usar LEFT JOIN para incluir pedidos sem cupom. Filtrar coupons_treated por dt com data mais recente."
+    example_sql: |
+      -- Efetividade de cupons: pedidos e receita por cupom
+      SELECT
+        o.coupon_code,
+        cp.coupon_status,
+        cp.utm_campaign,
+        COUNT(DISTINCT o.order_id) AS pedidos_com_cupom,
+        ROUND(SUM(o.total_value), 2) AS receita_total,
+        ROUND(AVG(o.total_value), 2) AS ticket_medio
+      FROM `{project_id}.{dataset}.orders_treated` o
+      LEFT JOIN `{project_id}.{dataset}.coupons_treated` cp ON o.coupon_code = cp.coupon_code
+        AND cp.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.coupons_treated`)
+      WHERE o.dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND o.coupon_code IS NOT NULL
+      GROUP BY o.coupon_code, cp.coupon_status, cp.utm_campaign
+      ORDER BY pedidos_com_cupom DESC
+
+  # =========================================================================
+  # catalog_treated → categories_treated (N:1)
+  # =========================================================================
+  - name: "catalog_to_categories"
+    from_table: "catalog_treated"
+    to_table: "categories_treated"
+    join_key: "category_id"
+    join_key_to: "category_id"
+    cardinality: "N:1"
+    requires_dedup: false
+    useful_fields: [name, parent_id, level]
+    gotcha: "Filtrar ambas as tabelas com a data mais recente (MAX(dt)) para obter o estado atual do catalogo e categorias."
+    example_sql: |
+      -- Produtos por categoria com estoque
+      SELECT
+        cat.name AS categoria,
+        cat.level AS nivel,
+        COUNT(DISTINCT c.product_id) AS total_produtos,
+        SUM(CASE WHEN c.has_stock THEN 1 ELSE 0 END) AS produtos_com_estoque,
+        ROUND(AVG(c.price_markup_pct), 1) AS markup_medio_pct
+      FROM `{project_id}.{dataset}.catalog_treated` c
+      JOIN `{project_id}.{dataset}.categories_treated` cat ON c.category_id = cat.category_id
+      WHERE c.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.catalog_treated`)
+        AND cat.dt = (SELECT MAX(dt) FROM `{project_id}.{dataset}.categories_treated`)
+      GROUP BY cat.name, cat.level
+      ORDER BY total_produtos DESC

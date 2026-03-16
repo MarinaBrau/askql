@@ -1,0 +1,200 @@
+source_name: vtex
+display_name: "VTEX (E-commerce)"
+description: >
+  Dados de e-commerce VTEX exportados para BigQuery via pipeline ELT customizado.
+  As tabelas ficam no dataset vtex_treated e sao views deduplicadas (ROW_NUMBER
+  ja aplicado no pipeline — NAO repetir dedup nas queries). Todos os valores
+  monetarios (total_value, price, selling_price, etc.) ja estao em REAIS —
+  NAO dividir por 100 (o ETL converte centavos para reais). Particionamento
+  por coluna `dt` (DATE, formato YYYY-MM-DD via Hive partitioning) — sempre
+  filtrar por `dt` para performance.
+
+tables:
+  # ── Pedidos ──────────────────────────────────────────────────────────────
+
+  - name: "orders_treated"
+    description: >
+      Pedidos deduplicados com UTMs, informacoes de entrega e promocoes.
+      View deduplicada — cada order_id aparece uma unica vez.
+      Particionada por dt (data de criacao do pedido).
+    primary_key: order_id
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: order_id
+        type: STRING
+        description: "ID unico do pedido (chave primaria). Ex: 'ABC-1234567890-01'"
+      - name: creation_date
+        type: STRING
+        description: "Data/hora de criacao do pedido no formato ISO 8601 (ex: 2026-01-15T14:32:00Z). Para filtrar por data usar dt. Para converter: DATE(creation_date)"
+      - name: status
+        type: STRING
+        description: "Status atual do pedido: payment-approved, invoiced, canceled, order-created, ready-for-handling, handling, waiting-for-seller-decision, etc."
+      - name: total_value
+        type: FLOAT64
+        description: "Valor total do pedido em REAIS (ja convertido de centavos pelo ETL). NAO dividir por 100."
+      - name: utm_source
+        type: STRING
+        description: "Fonte UTM do pedido (ex: google, facebook, instagram, email). Pode ser NULL se o pedido veio sem UTM."
+      - name: utm_campaign
+        type: STRING
+        description: "Campanha UTM do pedido (ex: black-friday-2026, remarketing-cart). Pode ser NULL."
+      - name: utm_medium
+        type: STRING
+        description: "Medium UTM do pedido (ex: cpc, social, email, organic). Pode ser NULL."
+      - name: coupon_code
+        type: STRING
+        description: "Codigo do cupom utilizado no pedido. NULL se nenhum cupom foi aplicado. FK para coupons_treated.coupon_code."
+      - name: delivery_company
+        type: STRING
+        description: "Nome da transportadora responsavel pela entrega. Ex: 'Correios', 'Jadlog', 'Total Express'."
+      - name: shipping_price
+        type: FLOAT64
+        description: "Valor do frete em REAIS (ja convertido pelo ETL). NAO dividir por 100."
+      - name: applied_promotions
+        type: STRING
+        description: "JSON string com array de promocoes aplicadas ao pedido. Para acessar os dados, usar JSON_EXTRACT_ARRAY() + UNNEST. Ex: '[{\"promotionId\":\"promo1\",\"name\":\"10%OFF\"}]'"
+      - name: dt
+        type: DATE
+        description: "Data de particao no formato YYYY-MM-DD (derivada de creation_date pelo pipeline). SEMPRE usar dt para filtros de data — proporciona performance maxima no BigQuery."
+
+  # ── Itens dos pedidos ─────────────────────────────────────────────────────
+
+  - name: "order_items_treated"
+    description: >
+      Itens dos pedidos deduplicados. Cada linha representa um SKU em um pedido.
+      View deduplicada — nao repetir ROW_NUMBER. FK para orders_treated (order_id)
+      e catalog_treated (product_id). Particionada por dt.
+    primary_key: ["order_id", "item_id"]
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: order_id
+        type: STRING
+        description: "ID do pedido pai. FK para orders_treated.order_id."
+      - name: item_id
+        type: STRING
+        description: "ID unico do item dentro do pedido (pode ser diferente do SKU ID)."
+      - name: product_id
+        type: STRING
+        description: "ID do produto. FK para catalog_treated.product_id. Pode ter multiplos SKUs."
+      - name: name
+        type: STRING
+        description: "Nome do produto/SKU no momento da compra."
+      - name: quantity
+        type: INT64
+        description: "Quantidade do item comprado no pedido."
+      - name: price
+        type: FLOAT64
+        description: "Preco de tabela do item em REAIS (sem desconto). NAO dividir por 100."
+      - name: selling_price
+        type: FLOAT64
+        description: "Preco efetivamente pago pelo cliente em REAIS (com desconto aplicado). NAO dividir por 100."
+      - name: total
+        type: FLOAT64
+        description: "Valor total do item (selling_price * quantity) em REAIS. NAO dividir por 100."
+      - name: brand_name
+        type: STRING
+        description: "Nome da marca do produto."
+      - name: dt
+        type: DATE
+        description: "Data de particao (mesma data do pedido pai). SEMPRE usar dt para filtros de data."
+
+  # ── Catalogo de produtos ──────────────────────────────────────────────────
+
+  - name: "catalog_treated"
+    description: >
+      Catalogo de SKUs com precos e estoque. View deduplicada.
+      Cada sku_id aparece uma unica vez com os dados mais recentes.
+      Particionada por dt (data de sincronizacao do catalogo).
+    primary_key: ["sku_id", "product_id"]
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: sku_id
+        type: STRING
+        description: "ID unico do SKU (variacao especifica do produto — ex: cor, tamanho)."
+      - name: product_id
+        type: STRING
+        description: "ID do produto pai. Um produto pode ter multiplos SKUs."
+      - name: product_name
+        type: STRING
+        description: "Nome do produto pai."
+      - name: brand_name
+        type: STRING
+        description: "Nome da marca do produto."
+      - name: category_id
+        type: STRING
+        description: "ID da categoria do produto. FK para categories_treated.category_id."
+      - name: list_price
+        type: FLOAT64
+        description: "Preco de tabela (de) em REAIS. NAO dividir por 100."
+      - name: base_price
+        type: FLOAT64
+        description: "Preco base de venda em REAIS. NAO dividir por 100."
+      - name: cost_price
+        type: FLOAT64
+        description: "Custo do produto em REAIS. NAO dividir por 100. Usar para calcular margem."
+      - name: price_markup_pct
+        type: FLOAT64
+        description: "Percentual de markup sobre o custo: (base_price - cost_price) / cost_price * 100. Ja calculado pelo pipeline."
+      - name: available_quantity
+        type: INT64
+        description: "Quantidade disponivel em estoque."
+      - name: has_stock
+        type: BOOLEAN
+        description: "TRUE se o produto tem estoque disponivel (available_quantity > 0)."
+      - name: dt
+        type: DATE
+        description: "Data de particao (sincronizacao do catalogo). SEMPRE usar dt para filtros de data."
+
+  # ── Categorias ────────────────────────────────────────────────────────────
+
+  - name: "categories_treated"
+    description: >
+      Arvore de categorias do catalogo VTEX. View deduplicada.
+      Estrutura hierarquica com parent_id e level. Particionada por dt.
+    primary_key: category_id
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: category_id
+        type: STRING
+        description: "ID unico da categoria. FK de catalog_treated.category_id."
+      - name: name
+        type: STRING
+        description: "Nome da categoria (ex: 'Calcados', 'Vestuario Masculino')."
+      - name: parent_id
+        type: STRING
+        description: "ID da categoria pai. NULL para categorias raiz (nivel 1). Permite navegar a arvore hierarquica."
+      - name: level
+        type: INT64
+        description: "Nivel hierarquico da categoria (1 = raiz, 2 = sub-categoria, 3 = sub-sub-categoria, etc.)."
+      - name: dt
+        type: DATE
+        description: "Data de particao. SEMPRE usar dt para filtros de data."
+
+  # ── Cupons ────────────────────────────────────────────────────────────────
+
+  - name: "coupons_treated"
+    description: >
+      Cupons com status derivado pelo pipeline. View deduplicada.
+      coupon_status e calculado com base em expiration_date e uso.
+      FK de orders_treated.coupon_code. Particionada por dt.
+    primary_key: coupon_code
+    partitioned_by: "dt (DATE, formato YYYY-MM-DD)"
+    fields:
+      - name: coupon_code
+        type: STRING
+        description: "Codigo do cupom (chave primaria). Ex: 'BLACKFRIDAY10', 'PRIMEIRACOMPRA'. FK de orders_treated.coupon_code."
+      - name: utm_source
+        type: STRING
+        description: "Fonte UTM associada ao cupom (ex: email, instagram). Permite ligar cupom a canal de midia."
+      - name: utm_campaign
+        type: STRING
+        description: "Campanha UTM associada ao cupom. Permite ligar cupom a campanha especifica."
+      - name: coupon_status
+        type: STRING
+        description: "Status derivado pelo pipeline: 'active' (valido e nao expirado), 'expired' (passou da data), 'used' (usado em pelo menos um pedido)."
+      - name: expiration_date_utc
+        type: TIMESTAMP
+        description: "Data/hora de expiracao do cupom em UTC. NULL se o cupom nao tem expiracao."
+      - name: dt
+        type: DATE
+        description: "Data de particao. SEMPRE usar dt para filtros de data."

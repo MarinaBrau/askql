@@ -1,0 +1,238 @@
+source_name: google_ads
+display_name: "Google Ads (BigQuery Transfer)"
+description: >
+  Google Ads data exported to BigQuery via Data Transfer Service.
+  Tables use wildcard suffix pattern (ads_TableName_YYYYMMDD) and are
+  partitioned by _TABLE_SUFFIX. Monetary values are stored in micros
+  (dividir por 1000000 para obter o valor real em moeda).
+
+tables:
+  # ── Stats tables (metricas diarias) ──────────────────────────────────
+
+  - name: "ads_CampaignStats_*"
+    description: "Metricas diarias agregadas por campanha. Cada linha = 1 campanha em 1 dia."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: customer_id
+        type: INT64
+        description: "ID da conta Google Ads (sem hifens)"
+      - name: campaign_id
+        type: INT64
+        description: "ID unico da campanha"
+      - name: segments_date
+        type: STRING
+        description: "Data do dado no formato YYYY-MM-DD"
+      - name: metrics_cost_micros
+        type: INT64
+        description: "Custo em micros (dividir por 1000000 para valor real em moeda)"
+      - name: metrics_impressions
+        type: INT64
+        description: "Numero total de impressoes"
+      - name: metrics_clicks
+        type: INT64
+        description: "Numero total de cliques"
+      - name: metrics_conversions
+        type: FLOAT64
+        description: "Numero de conversoes (pode ser fracionario por modelo de atribuicao)"
+      - name: metrics_conversions_value
+        type: FLOAT64
+        description: "Valor total das conversoes em moeda"
+      - name: metrics_interactions
+        type: INT64
+        description: "Numero total de interacoes (cliques, swipes, views dependendo do tipo de campanha)"
+      - name: metrics_ctr
+        type: FLOAT64
+        description: "Click-through rate (cliques / impressoes). Ja vem calculado como decimal (ex: 0.05 = 5%)"
+      - name: metrics_average_cpc
+        type: FLOAT64
+        description: "Custo medio por clique em micros. Dividir por 1000000 para valor real"
+
+  - name: "ads_AdGroupStats_*"
+    description: "Metricas diarias agregadas por grupo de anuncios. Cada linha = 1 ad group em 1 dia."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: customer_id
+        type: INT64
+        description: "ID da conta Google Ads (sem hifens)"
+      - name: campaign_id
+        type: INT64
+        description: "ID unico da campanha"
+      - name: ad_group_id
+        type: INT64
+        description: "ID unico do grupo de anuncios"
+      - name: segments_date
+        type: STRING
+        description: "Data do dado no formato YYYY-MM-DD"
+      - name: metrics_cost_micros
+        type: INT64
+        description: "Custo em micros (dividir por 1000000 para valor real em moeda)"
+      - name: metrics_impressions
+        type: INT64
+        description: "Numero total de impressoes"
+      - name: metrics_clicks
+        type: INT64
+        description: "Numero total de cliques"
+      - name: metrics_conversions
+        type: FLOAT64
+        description: "Numero de conversoes (pode ser fracionario por modelo de atribuicao)"
+      - name: metrics_conversions_value
+        type: FLOAT64
+        description: "Valor total das conversoes em moeda"
+      - name: metrics_interactions
+        type: INT64
+        description: "Numero total de interacoes"
+      - name: metrics_ctr
+        type: FLOAT64
+        description: "Click-through rate (cliques / impressoes). Ja vem calculado como decimal"
+      - name: metrics_average_cpc
+        type: FLOAT64
+        description: "Custo medio por clique em micros. Dividir por 1000000 para valor real"
+
+  - name: "ads_AdStats_*"
+    description: "Metricas diarias por anuncio individual. Cada linha = 1 anuncio em 1 dia."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: customer_id
+        type: INT64
+        description: "ID da conta Google Ads (sem hifens)"
+      - name: campaign_id
+        type: INT64
+        description: "ID unico da campanha"
+      - name: ad_group_id
+        type: INT64
+        description: "ID unico do grupo de anuncios"
+      - name: ad_id
+        type: INT64
+        description: "ID unico do anuncio"
+      - name: segments_date
+        type: STRING
+        description: "Data do dado no formato YYYY-MM-DD"
+      - name: metrics_cost_micros
+        type: INT64
+        description: "Custo em micros (dividir por 1000000 para valor real em moeda)"
+      - name: metrics_impressions
+        type: INT64
+        description: "Numero total de impressoes"
+      - name: metrics_clicks
+        type: INT64
+        description: "Numero total de cliques"
+      - name: metrics_conversions
+        type: FLOAT64
+        description: "Numero de conversoes (pode ser fracionario por modelo de atribuicao)"
+      - name: metrics_conversions_value
+        type: FLOAT64
+        description: "Valor total das conversoes em moeda"
+      - name: metrics_interactions
+        type: INT64
+        description: "Numero total de interacoes"
+      - name: metrics_ctr
+        type: FLOAT64
+        description: "Click-through rate (cliques / impressoes). Ja vem calculado como decimal"
+      - name: metrics_average_cpc
+        type: FLOAT64
+        description: "Custo medio por clique em micros. Dividir por 1000000 para valor real"
+
+  - name: "ads_KeywordStats_*"
+    description: "Metricas diarias por palavra-chave. Cada linha = 1 keyword em 1 dia."
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: customer_id
+        type: INT64
+        description: "ID da conta Google Ads (sem hifens)"
+      - name: campaign_id
+        type: INT64
+        description: "ID unico da campanha"
+      - name: ad_group_id
+        type: INT64
+        description: "ID unico do grupo de anuncios"
+      - name: keyword_id
+        type: INT64
+        description: "ID unico da palavra-chave"
+      - name: keyword_text
+        type: STRING
+        description: "Texto da palavra-chave"
+      - name: keyword_match_type
+        type: STRING
+        description: "Tipo de correspondencia: EXACT, PHRASE ou BROAD"
+      - name: segments_date
+        type: STRING
+        description: "Data do dado no formato YYYY-MM-DD"
+      - name: metrics_cost_micros
+        type: INT64
+        description: "Custo em micros (dividir por 1000000 para valor real em moeda)"
+      - name: metrics_impressions
+        type: INT64
+        description: "Numero total de impressoes"
+      - name: metrics_clicks
+        type: INT64
+        description: "Numero total de cliques"
+      - name: metrics_conversions
+        type: FLOAT64
+        description: "Numero de conversoes (pode ser fracionario por modelo de atribuicao)"
+      - name: metrics_conversions_value
+        type: FLOAT64
+        description: "Valor total das conversoes em moeda"
+      - name: metrics_interactions
+        type: INT64
+        description: "Numero total de interacoes"
+      - name: metrics_ctr
+        type: FLOAT64
+        description: "Click-through rate (cliques / impressoes). Ja vem calculado como decimal"
+      - name: metrics_average_cpc
+        type: FLOAT64
+        description: "Custo medio por clique em micros. Dividir por 1000000 para valor real"
+
+  # ── Config tables (dimensoes / cadastro) ─────────────────────────────
+
+  - name: "ads_Campaign_*"
+    description: >
+      Configuracao e metadados de campanhas. Pode ter multiplas entradas por
+      _DATA_DATE para a mesma campanha — usar ROW_NUMBER para deduplicar.
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: customer_id
+        type: INT64
+        description: "ID da conta Google Ads (sem hifens)"
+      - name: campaign_id
+        type: INT64
+        description: "ID unico da campanha"
+      - name: campaign_name
+        type: STRING
+        description: "Nome da campanha definido pelo usuario"
+      - name: campaign_status
+        type: STRING
+        description: "Status da campanha: ENABLED, PAUSED ou REMOVED"
+      - name: campaign_advertising_channel_type
+        type: STRING
+        description: "Tipo de canal: SEARCH, DISPLAY, VIDEO, SHOPPING, PERFORMANCE_MAX, etc."
+      - name: campaign_bidding_strategy_type
+        type: STRING
+        description: "Estrategia de lance: TARGET_CPA, MAXIMIZE_CONVERSIONS, MANUAL_CPC, etc."
+      - name: campaign_budget_amount_micros
+        type: INT64
+        description: "Orcamento diario da campanha em micros (dividir por 1000000 para valor real)"
+
+  - name: "ads_AdGroup_*"
+    description: >
+      Configuracao e metadados de grupos de anuncios. Pode ter multiplas
+      entradas por _DATA_DATE para o mesmo ad group — usar ROW_NUMBER para deduplicar.
+    partitioned_by: "_TABLE_SUFFIX (YYYYMMDD)"
+    fields:
+      - name: customer_id
+        type: INT64
+        description: "ID da conta Google Ads (sem hifens)"
+      - name: campaign_id
+        type: INT64
+        description: "ID da campanha pai"
+      - name: ad_group_id
+        type: INT64
+        description: "ID unico do grupo de anuncios"
+      - name: ad_group_name
+        type: STRING
+        description: "Nome do grupo de anuncios definido pelo usuario"
+      - name: ad_group_status
+        type: STRING
+        description: "Status do ad group: ENABLED, PAUSED ou REMOVED"
+      - name: ad_group_type
+        type: STRING
+        description: "Tipo do ad group: SEARCH_STANDARD, DISPLAY_STANDARD, VIDEO_RESPONSIVE, etc."

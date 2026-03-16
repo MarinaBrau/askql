@@ -1,0 +1,180 @@
+source_name: shopify
+description: >
+  Gotchas criticos para gerar SQL correto sobre tabelas do Shopify no BigQuery.
+  Dataset: shopify_treated. Todas as tabelas sao views deduplicadas.
+
+gotchas:
+  - id: 1
+    title: "Usar dt para filtros de data (nao DATE(created_at))"
+    severity: critical
+    description: >
+      A coluna dt (DATE) e a coluna de particionamento em todas as tabelas.
+      SEMPRE inclua filtro por dt para acionar partition pruning no BigQuery,
+      reduzindo drasticamente o volume de dados escaneados e o custo.
+      Diferente do VTEX (onde created_at era STRING), aqui created_at e TIMESTAMP —
+      DATE(created_at) funciona, mas nao ativa partition pruning. Use dt.
+    correct_example: |
+      -- Correto: filtra por dt (partition pruning ativo)
+      SELECT order_id, financial_status, total_price
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+    incorrect_example: |
+      -- ERRADO: sem filtro de dt — escaneia TODAS as particoes (caro!)
+      SELECT order_id, financial_status, total_price
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE DATE(created_at) BETWEEN '2026-01-01' AND '2026-01-31'
+
+  - id: 2
+    title: "NAO adicionar ROW_NUMBER — views ja sao deduplicadas"
+    severity: high
+    description: >
+      As views *_treated ja aplicam ROW_NUMBER() OVER (PARTITION BY ... ORDER BY extracted_at DESC)
+      internamente. Adicionar deduplicacao manualmente e desnecessario, aumenta o custo
+      computacional e pode introduzir bugs sutis.
+    correct_example: |
+      -- Correto: consultar diretamente (ja deduplicado)
+      SELECT order_id, financial_status, total_price
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+    incorrect_example: |
+      -- ERRADO: ROW_NUMBER desnecessario (pipeline ja deduplicou)
+      WITH dedup AS (
+        SELECT *, ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY created_at DESC) AS rn
+        FROM `{project_id}.{dataset}.orders_treated`
+      )
+      SELECT * FROM dedup WHERE rn = 1
+
+  - id: 3
+    title: "tags e ARRAY<STRING> — requer UNNEST para filtrar individualmente"
+    severity: high
+    description: >
+      Os campos tags em orders_treated, products_treated e customers_treated
+      sao do tipo ARRAY<STRING> (REPEATED no BigQuery). Para filtrar por uma
+      tag especifica ou explodir as tags em linhas, use UNNEST. Nao e possivel
+      comparar diretamente com =.
+    correct_example: |
+      -- Filtrar pedidos com tag 'vip' usando UNNEST
+      SELECT
+        order_id,
+        total_price
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND EXISTS (SELECT 1 FROM UNNEST(tags) t WHERE t = 'vip')
+
+      -- Alternativa: explodir tags em linhas
+      SELECT
+        order_id,
+        tag
+      FROM `{project_id}.{dataset}.orders_treated`,
+        UNNEST(tags) AS tag
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+    incorrect_example: |
+      -- ERRADO: nao e possivel comparar ARRAY com = diretamente
+      SELECT order_id FROM `{project_id}.{dataset}.orders_treated`
+      WHERE tags = 'vip'
+
+  - id: 4
+    title: "discount_codes e JSON string — usar JSON_EXTRACT_ARRAY para multiplos cupons"
+    severity: medium
+    description: >
+      O campo discount_codes em orders_treated e uma STRING contendo um JSON array.
+      Para pedidos com um unico cupom, use o campo coupon_code (mais simples).
+      Para acessar todos os cupons ou detalhes (codigo + tipo + valor), use
+      JSON_EXTRACT_ARRAY() + UNNEST sobre discount_codes.
+    correct_example: |
+      -- Usar coupon_code para filtro simples por cupom
+      SELECT order_id, coupon_code, total_price
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND coupon_code IS NOT NULL
+
+      -- Usar JSON_EXTRACT_ARRAY para explodir multiplos cupons
+      SELECT
+        o.order_id,
+        JSON_VALUE(dc, '$.code') AS codigo_cupom,
+        JSON_VALUE(dc, '$.type') AS tipo_desconto,
+        SAFE_CAST(JSON_VALUE(dc, '$.amount') AS FLOAT64) AS valor_desconto
+      FROM `{project_id}.{dataset}.orders_treated` o,
+        UNNEST(JSON_EXTRACT_ARRAY(o.discount_codes)) AS dc
+      WHERE o.dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND o.discount_codes IS NOT NULL
+        AND o.discount_codes != '[]'
+    incorrect_example: |
+      -- ERRADO: discount_codes e STRING, nao campo estruturado
+      SELECT discount_codes.code FROM orders_treated
+
+  - id: 5
+    title: "PII ja mascarado — usar campos _masked"
+    severity: high
+    description: >
+      Os campos de dados pessoais (email, nome, telefone) ja vem mascarados
+      nas views treated. Nao existe campo com email ou nome completo.
+      Use customer_email_masked, customer_first_name_masked, customer_last_name_masked
+      em orders_treated; e email_masked, first_name_masked, last_name_masked,
+      phone_masked em customers_treated.
+    correct_example: |
+      -- Correto: usar campos mascarados disponíveis
+      SELECT
+        customer_id,
+        customer_email_masked,
+        total_price
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+    incorrect_example: |
+      -- ERRADO: campo customer_email nao existe na view treated
+      SELECT customer_email FROM `{project_id}.{dataset}.orders_treated`
+
+  - id: 6
+    title: "Campos derivados ja calculados — nao recalcular"
+    severity: medium
+    description: >
+      O pipeline Shopify calcula varios campos derivados automaticamente.
+      Em orders_treated: order_date, order_day_of_week, order_hour, order_month,
+      order_year, has_coupon, has_discount, has_utm.
+      Em products_treated: is_on_sale, has_stock, stock_level, discount_percentage,
+      days_since_created, days_since_published.
+      Em customers_treated: customer_segment, frequency_segment, avg_order_value,
+      signup_date, days_since_signup, days_since_last_activity.
+      Use esses campos diretamente — nao recalcule nas queries.
+    correct_example: |
+      -- Usar campos derivados diretamente
+      SELECT
+        order_date,
+        has_coupon,
+        financial_status,
+        COUNT(*) AS pedidos
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+      GROUP BY order_date, has_coupon, financial_status
+    incorrect_example: |
+      -- DESNECESSARIO: recalcular o que ja esta pre-calculado
+      SELECT
+        DATE(created_at) AS order_date,
+        CASE WHEN coupon_code IS NOT NULL THEN TRUE ELSE FALSE END AS has_coupon
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+
+  - id: 7
+    title: "financial_status para receita confirmada — usar 'paid'"
+    severity: critical
+    description: >
+      Para relatorios de receita confirmada, filtrar SEMPRE financial_status = 'paid'.
+      Outros status (pending, authorized, refunded, voided) representam receita
+      nao confirmada, estornada ou cancelada. Incluir todos os status superestima
+      a receita real.
+    correct_example: |
+      -- Receita confirmada: apenas pedidos pagos
+      SELECT
+        dt AS data,
+        COUNT(DISTINCT order_id) AS pedidos_pagos,
+        ROUND(SUM(total_price), 2) AS receita
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'
+        AND financial_status = 'paid'
+      GROUP BY dt
+      ORDER BY dt
+    incorrect_example: |
+      -- CUIDADO: inclui pedidos pendentes, estornados e cancelados
+      SELECT ROUND(SUM(total_price), 2) AS receita
+      FROM `{project_id}.{dataset}.orders_treated`
+      WHERE dt BETWEEN '2026-01-01' AND '2026-01-31'

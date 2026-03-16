@@ -1,0 +1,470 @@
+source_name: ga4_bigquery
+display_name: "GA4 BigQuery Export — Common Query Templates"
+description: "Templates de consultas SQL prontas para uso com dados GA4 no BigQuery. Cada template usa os padroes corretos: _TABLE_SUFFIX para datas, UNNEST para event_params, CROSS JOIN UNNEST para items."
+
+templates:
+  # ============================================================
+  # ACQUISITION — Fontes de trafego, campanhas, novos usuarios
+  # ============================================================
+
+  - title: "Top Sources/Mediums"
+    category: acquisition
+    description: "Identifica as principais fontes e meios de trafego que geram sessoes para o site, ordenados pelo volume de sessoes."
+    natural_language: "Quais sao as principais fontes de trafego do meu site?"
+    sql: |
+      -- Top fontes/meios de trafego por volume de sessoes
+      -- Usa session_start para contar sessoes e extrai source/medium de event_params
+      SELECT
+        -- Extrai source e medium dos parametros do evento
+        COALESCE(
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source'),
+          '(direct)'
+        ) AS fonte,
+        COALESCE(
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium'),
+          '(none)'
+        ) AS meio,
+        -- Combina source/medium no formato padrao do GA
+        CONCAT(
+          COALESCE((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source'), '(direct)'),
+          ' / ',
+          COALESCE((SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium'), '(none)')
+        ) AS fonte_meio,
+        -- Conta sessoes unicas usando user_pseudo_id + ga_session_id
+        COUNT(DISTINCT CONCAT(
+          user_pseudo_id, '-',
+          CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+        )) AS sessoes,
+        -- Conta usuarios unicos
+        COUNT(DISTINCT user_pseudo_id) AS usuarios
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE
+        -- Filtro eficiente por data usando _TABLE_SUFFIX (evita full scan)
+        _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        -- Filtra apenas eventos de inicio de sessao
+        AND event_name = 'session_start'
+      GROUP BY fonte, meio, fonte_meio
+      ORDER BY sessoes DESC
+      LIMIT 20
+    explanation: >
+      Esta consulta mostra de onde vem o trafego do seu site, combinando fonte (Google, Facebook,
+      direto, etc.) com o meio (organico, pago, referencia, etc.). E o equivalente ao relatorio
+      de Aquisicao do GA4, mas direto do BigQuery. Os resultados sao ordenados pelas fontes
+      que mais geram sessoes, ajudando a identificar seus canais mais relevantes.
+
+  - title: "Campaign Performance"
+    category: acquisition
+    description: "Avalia o desempenho das campanhas de marketing mostrando sessoes, usuarios unicos e taxa de engajamento por campanha."
+    natural_language: "Como estao performando minhas campanhas de marketing?"
+    sql: |
+      -- Desempenho de campanhas de marketing
+      -- Mostra sessoes, usuarios e taxa de engajamento por campanha
+      SELECT
+        -- Nome da campanha extraido dos parametros do evento
+        COALESCE(
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'campaign'),
+          '(not set)'
+        ) AS campanha,
+        -- Fonte e meio para contexto
+        COALESCE(
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source'),
+          '(direct)'
+        ) AS fonte,
+        COALESCE(
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium'),
+          '(none)'
+        ) AS meio,
+        -- Sessoes unicas (user_pseudo_id + ga_session_id)
+        COUNT(DISTINCT CONCAT(
+          user_pseudo_id, '-',
+          CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+        )) AS sessoes,
+        -- Usuarios unicos
+        COUNT(DISTINCT user_pseudo_id) AS usuarios,
+        -- Taxa de engajamento: sessoes com session_engaged = 1 / total de sessoes
+        ROUND(
+          COUNTIF(
+            (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'session_engaged') = 1
+          ) * 100.0
+          / COUNT(DISTINCT CONCAT(
+              user_pseudo_id, '-',
+              CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+            )),
+          2
+        ) AS taxa_engajamento_pct
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE
+        -- Filtro eficiente por data
+        _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        -- Apenas eventos de inicio de sessao para evitar contagem duplicada
+        AND event_name = 'session_start'
+      GROUP BY campanha, fonte, meio
+      -- Ignora sessoes sem campanha definida para focar em trafego de campanhas
+      HAVING campanha != '(not set)'
+      ORDER BY sessoes DESC
+      LIMIT 20
+    explanation: >
+      Esta consulta avalia o desempenho das suas campanhas de marketing mostrando quantas
+      sessoes e usuarios unicos cada campanha gerou. A taxa de engajamento indica a porcentagem
+      de sessoes em que os usuarios interagiram ativamente com o site (equivalente ao bounce
+      rate invertido do GA4). Campanhas com alta taxa de engajamento trazem trafego mais qualificado.
+
+  - title: "New vs Returning Users"
+    category: acquisition
+    description: "Compara a proporcao de usuarios novos (primeira visita) versus usuarios recorrentes em um periodo."
+    natural_language: "Qual a proporcao de usuarios novos vs recorrentes?"
+    sql: |
+      -- Proporcao de usuarios novos vs recorrentes
+      -- first_visit identifica novos; session_start sem first_visit identifica recorrentes
+      WITH sessoes AS (
+        SELECT
+          user_pseudo_id,
+          -- Identifica se o usuario teve um first_visit no periodo
+          MAX(CASE WHEN event_name = 'first_visit' THEN 1 ELSE 0 END) AS is_new_user
+        FROM `{project_id}.{dataset}.events_*`
+        WHERE
+          -- Filtro eficiente por data
+          _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+          AND event_name IN ('first_visit', 'session_start')
+        GROUP BY user_pseudo_id
+      )
+      SELECT
+        -- Classifica o usuario como novo ou recorrente
+        CASE WHEN is_new_user = 1 THEN 'Novo' ELSE 'Recorrente' END AS tipo_usuario,
+        -- Total de usuarios em cada categoria
+        COUNT(DISTINCT user_pseudo_id) AS usuarios,
+        -- Porcentagem do total
+        ROUND(
+          COUNT(DISTINCT user_pseudo_id) * 100.0
+          / SUM(COUNT(DISTINCT user_pseudo_id)) OVER (),
+          2
+        ) AS percentual
+      FROM sessoes
+      GROUP BY tipo_usuario
+      ORDER BY usuarios DESC
+    explanation: >
+      Esta consulta separa seus usuarios em duas categorias: novos (primeira visita ao site
+      no periodo) e recorrentes (ja visitaram antes). A proporcao entre novos e recorrentes
+      e um indicador importante da saude do seu marketing — muitos novos usuarios indicam
+      bom alcance, enquanto recorrentes indicam retencao e fidelizacao. O ideal e ter um
+      equilíbrio saudavel entre ambos.
+
+  # ============================================================
+  # ENGAGEMENT — Paginas, tempo de engajamento
+  # ============================================================
+
+  - title: "Top Pages by Views"
+    category: engagement
+    description: "Lista as paginas mais acessadas do site com contagem de visualizacoes e usuarios unicos."
+    natural_language: "Quais sao as paginas mais acessadas do meu site?"
+    sql: |
+      -- Paginas mais visualizadas do site
+      -- Extrai page_location e page_title de event_params em eventos page_view
+      SELECT
+        -- URL da pagina
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS pagina_url,
+        -- Titulo da pagina para facilitar identificacao
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_title') AS pagina_titulo,
+        -- Total de visualizacoes (pageviews)
+        COUNT(*) AS visualizacoes,
+        -- Usuarios unicos que viram esta pagina
+        COUNT(DISTINCT user_pseudo_id) AS usuarios_unicos,
+        -- Sessoes unicas que incluiram esta pagina
+        COUNT(DISTINCT CONCAT(
+          user_pseudo_id, '-',
+          CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+        )) AS sessoes
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE
+        -- Filtro eficiente por data
+        _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        -- Apenas eventos de visualizacao de pagina
+        AND event_name = 'page_view'
+      GROUP BY pagina_url, pagina_titulo
+      ORDER BY visualizacoes DESC
+      LIMIT 20
+    explanation: >
+      Esta consulta lista as 20 paginas mais visualizadas do seu site, mostrando o total de
+      pageviews, usuarios unicos e sessoes para cada uma. E o equivalente ao relatorio de
+      Paginas e Telas do GA4. Use para identificar qual conteudo atrai mais trafego e quais
+      paginas sao pontos de entrada importantes do seu site.
+
+  - title: "Average Engagement Time by Page"
+    category: engagement
+    description: "Calcula o tempo medio de engajamento ativo por pagina, em segundos."
+    natural_language: "Qual o tempo medio de engajamento por pagina?"
+    sql: |
+      -- Tempo medio de engajamento por pagina
+      -- Usa engagement_time_msec do evento user_engagement
+      SELECT
+        -- URL da pagina
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS pagina_url,
+        -- Titulo da pagina
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_title') AS pagina_titulo,
+        -- Tempo medio de engajamento convertido de milissegundos para segundos
+        ROUND(
+          AVG(
+            (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'engagement_time_msec')
+          ) / 1000,
+          1
+        ) AS tempo_medio_engajamento_seg,
+        -- Total de eventos de engajamento para contexto
+        COUNT(*) AS eventos_engajamento,
+        -- Usuarios unicos
+        COUNT(DISTINCT user_pseudo_id) AS usuarios_unicos
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE
+        -- Filtro eficiente por data
+        _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        -- Filtra eventos de engajamento do usuario (contem engagement_time_msec)
+        AND event_name = 'user_engagement'
+      GROUP BY pagina_url, pagina_titulo
+      -- Filtra paginas com volume minimo para evitar outliers
+      HAVING eventos_engajamento >= 10
+      ORDER BY tempo_medio_engajamento_seg DESC
+      LIMIT 20
+    explanation: >
+      Esta consulta mostra quanto tempo, em media, os usuarios passam engajados em cada pagina
+      do site. O tempo de engajamento e medido pelo GA4 apenas quando o usuario esta ativamente
+      interagindo com a pagina (nao inclui tempo em abas inativas). Paginas com alto tempo
+      de engajamento indicam conteudo relevante; paginas com tempo muito baixo podem precisar
+      de melhorias.
+
+  # ============================================================
+  # E-COMMERCE — Funil, produtos, receita por canal
+  # ============================================================
+
+  - title: "Purchase Funnel"
+    category: ecommerce
+    description: "Mostra o funil de conversao completo: visualizacao de produto, carrinho, checkout e compra, com taxas de conversao entre etapas."
+    natural_language: "Como esta meu funil de conversao? (visualizacao -> carrinho -> checkout -> compra)"
+    sql: |
+      -- Funil de conversao e-commerce
+      -- Conta sessoes unicas em cada etapa do funil
+      WITH funnel AS (
+        SELECT
+          event_name,
+          -- Sessoes unicas em cada etapa (user_pseudo_id + ga_session_id)
+          COUNT(DISTINCT CONCAT(
+            user_pseudo_id, '-',
+            CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+          )) AS sessoes
+        FROM `{project_id}.{dataset}.events_*`
+        WHERE
+          -- Filtro eficiente por data
+          _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+          -- Filtra apenas os 4 eventos do funil
+          AND event_name IN ('view_item', 'add_to_cart', 'begin_checkout', 'purchase')
+        GROUP BY event_name
+      )
+      SELECT
+        -- Ordena as etapas na sequencia logica do funil
+        CASE event_name
+          WHEN 'view_item' THEN 1
+          WHEN 'add_to_cart' THEN 2
+          WHEN 'begin_checkout' THEN 3
+          WHEN 'purchase' THEN 4
+        END AS etapa_ordem,
+        CASE event_name
+          WHEN 'view_item' THEN 'Visualizacao de Produto'
+          WHEN 'add_to_cart' THEN 'Adicionou ao Carrinho'
+          WHEN 'begin_checkout' THEN 'Iniciou Checkout'
+          WHEN 'purchase' THEN 'Compra Concluida'
+        END AS etapa,
+        sessoes,
+        -- Taxa de conversao em relacao a primeira etapa (view_item)
+        ROUND(
+          sessoes * 100.0 / MAX(sessoes) OVER (),
+          2
+        ) AS taxa_conversao_total_pct
+      FROM funnel
+      ORDER BY etapa_ordem
+    explanation: >
+      Esta consulta monta o funil de conversao do seu e-commerce com 4 etapas: visualizacao
+      do produto, adicao ao carrinho, inicio do checkout e compra concluida. Cada etapa mostra
+      quantas sessoes unicas chegaram ate ali. A taxa de conversao total mostra o percentual
+      em relacao ao topo do funil. Quedas grandes entre etapas indicam pontos de atrito que
+      precisam de atencao — por exemplo, muitas desistencias no checkout podem indicar
+      problemas no processo de pagamento.
+
+  - title: "Top Products by Revenue"
+    category: ecommerce
+    description: "Lista os produtos que mais geram receita, com quantidade vendida e numero de transacoes."
+    natural_language: "Quais sao os produtos que mais geram receita?"
+    sql: |
+      -- Produtos com maior receita
+      -- Usa CROSS JOIN UNNEST(items) para expandir itens de cada transacao
+      SELECT
+        -- Dados do produto (acessados via alias item do UNNEST)
+        item.item_name AS produto,
+        item.item_category AS categoria,
+        -- Metricas de vendas
+        COUNT(*) AS vezes_comprado,
+        SUM(item.quantity) AS quantidade_total,
+        -- Receita total do produto
+        ROUND(SUM(item.item_revenue), 2) AS receita_total,
+        -- Receita media por unidade
+        ROUND(
+          SAFE_DIVIDE(SUM(item.item_revenue), SUM(item.quantity)),
+          2
+        ) AS receita_media_por_unidade,
+        -- Transacoes unicas que incluiram este produto
+        COUNT(DISTINCT ecommerce.transaction_id) AS transacoes
+      FROM `{project_id}.{dataset}.events_*`,
+        -- CROSS JOIN UNNEST expande cada item em uma linha separada
+        UNNEST(items) AS item
+      WHERE
+        -- Filtro eficiente por data
+        _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        -- Apenas eventos de compra concluida
+        AND event_name = 'purchase'
+      GROUP BY produto, categoria
+      ORDER BY receita_total DESC
+      LIMIT 20
+    explanation: >
+      Esta consulta lista os 20 produtos que mais geram receita no seu e-commerce. Para cada
+      produto, mostra a categoria, quantidade vendida, receita total e receita media por unidade.
+      Os dados vem do array de itens dentro dos eventos de compra (purchase). Use para identificar
+      seus best-sellers e entender quais produtos sao os pilares de receita do negocio.
+
+  - title: "Revenue by Traffic Source"
+    category: ecommerce
+    description: "Mostra quais fontes de trafego geram mais receita, com numero de transacoes e receita media por transacao."
+    natural_language: "Qual fonte de trafego gera mais receita?"
+    sql: |
+      -- Receita por fonte de trafego
+      -- Cruza eventos de purchase com source/medium dos event_params
+      SELECT
+        -- Fonte e meio de trafego da sessao de compra
+        COALESCE(
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source'),
+          '(direct)'
+        ) AS fonte,
+        COALESCE(
+          (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium'),
+          '(none)'
+        ) AS meio,
+        -- Receita total de compras (usa ecommerce.purchase_revenue como fonte primaria)
+        ROUND(
+          SUM(
+            COALESCE(
+              ecommerce.purchase_revenue,
+              (SELECT value.float_value FROM UNNEST(event_params) WHERE key = 'value')
+            )
+          ),
+          2
+        ) AS receita_total,
+        -- Numero de transacoes unicas
+        COUNT(DISTINCT ecommerce.transaction_id) AS transacoes,
+        -- Receita media por transacao
+        ROUND(
+          SAFE_DIVIDE(
+            SUM(
+              COALESCE(
+                ecommerce.purchase_revenue,
+                (SELECT value.float_value FROM UNNEST(event_params) WHERE key = 'value')
+              )
+            ),
+            COUNT(DISTINCT ecommerce.transaction_id)
+          ),
+          2
+        ) AS receita_media_por_transacao,
+        -- Usuarios compradores unicos
+        COUNT(DISTINCT user_pseudo_id) AS compradores
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE
+        -- Filtro eficiente por data
+        _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        -- Apenas eventos de compra
+        AND event_name = 'purchase'
+      GROUP BY fonte, meio
+      ORDER BY receita_total DESC
+      LIMIT 20
+    explanation: >
+      Esta consulta revela quais fontes de trafego trazem os compradores que mais gastam.
+      Mostra receita total, numero de transacoes e ticket medio por canal. Usa COALESCE
+      para capturar receita tanto do campo ecommerce.purchase_revenue quanto do parametro
+      'value', garantindo que nenhuma transacao fique de fora. Essencial para decisoes de
+      investimento em midia — saber qual canal converte em vendas, nao apenas em cliques.
+
+  # ============================================================
+  # AUDIENCE — Dispositivos, geografia
+  # ============================================================
+
+  - title: "Users by Device Category"
+    category: audience
+    description: "Distribui usuarios, sessoes e pageviews por tipo de dispositivo (desktop, mobile, tablet)."
+    natural_language: "Como meus usuarios se distribuem por tipo de dispositivo?"
+    sql: |
+      -- Distribuicao de usuarios por tipo de dispositivo
+      -- Usa device.category (campo STRUCT de nivel superior)
+      SELECT
+        -- Tipo de dispositivo: desktop, mobile ou tablet
+        device.category AS dispositivo,
+        -- Usuarios unicos
+        COUNT(DISTINCT user_pseudo_id) AS usuarios,
+        -- Sessoes unicas
+        COUNT(DISTINCT CONCAT(
+          user_pseudo_id, '-',
+          CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+        )) AS sessoes,
+        -- Pageviews (apenas eventos page_view)
+        COUNTIF(event_name = 'page_view') AS pageviews,
+        -- Porcentagem de usuarios por dispositivo
+        ROUND(
+          COUNT(DISTINCT user_pseudo_id) * 100.0
+          / SUM(COUNT(DISTINCT user_pseudo_id)) OVER (),
+          2
+        ) AS percentual_usuarios
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE
+        -- Filtro eficiente por data
+        _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+      GROUP BY dispositivo
+      ORDER BY usuarios DESC
+    explanation: >
+      Esta consulta mostra como seus usuarios se dividem entre desktop, mobile e tablet.
+      Alem da contagem de usuarios, inclui sessoes e pageviews para entender o
+      comportamento em cada dispositivo. Se o mobile domina em usuarios mas tem menos
+      pageviews por sessao, pode indicar que a experiencia mobile precisa de melhorias.
+      Esse dado e fundamental para priorizar otimizacoes de UX e campanhas por dispositivo.
+
+  - title: "Users by Geography"
+    category: audience
+    description: "Mostra de quais paises e regioes vem os usuarios, com volume de sessoes."
+    natural_language: "De quais regioes vem meus usuarios?"
+    sql: |
+      -- Distribuicao geografica dos usuarios
+      -- Usa geo.country e geo.region (campos STRUCT de nivel superior)
+      SELECT
+        -- Pais e estado/regiao (dados inferidos pelo IP do usuario)
+        geo.country AS pais,
+        geo.region AS estado_regiao,
+        -- Usuarios unicos
+        COUNT(DISTINCT user_pseudo_id) AS usuarios,
+        -- Sessoes unicas
+        COUNT(DISTINCT CONCAT(
+          user_pseudo_id, '-',
+          CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+        )) AS sessoes,
+        -- Porcentagem de usuarios
+        ROUND(
+          COUNT(DISTINCT user_pseudo_id) * 100.0
+          / SUM(COUNT(DISTINCT user_pseudo_id)) OVER (),
+          2
+        ) AS percentual_usuarios
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE
+        -- Filtro eficiente por data
+        _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        -- Apenas eventos de inicio de sessao para nao inflar contagem
+        AND event_name = 'session_start'
+      GROUP BY pais, estado_regiao
+      ORDER BY usuarios DESC
+      LIMIT 20
+    explanation: >
+      Esta consulta mostra de quais paises e estados/regioes vem seus usuarios, ordenados
+      por volume. Os dados geograficos sao inferidos pelo IP do usuario pelo Google Analytics.
+      E util para entender sua audiencia regional, planejar campanhas geolocalizadas e
+      identificar mercados com potencial de crescimento. Se voce opera no Brasil, espere
+      ver estados como Sao Paulo e Rio de Janeiro no topo.

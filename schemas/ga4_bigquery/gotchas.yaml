@@ -1,0 +1,238 @@
+source_name: ga4_bigquery
+display_name: "GA4 BigQuery Export — Gotchas"
+description: "Armadilhas criticas e padroes obrigatorios para gerar SQL correto no GA4 BigQuery Export."
+
+gotchas:
+  - id: 1
+    title: "Filtro de data eficiente com _TABLE_SUFFIX"
+    severity: critical
+    description: >
+      Para filtrar por data, SEMPRE usar _TABLE_SUFFIX ao inves de WHERE event_date.
+      As tabelas GA4 sao sharded por dia (events_YYYYMMDD). Usar _TABLE_SUFFIX permite
+      ao BigQuery fazer partition pruning e escanear apenas as tabelas dos dias necessarios.
+      Sem isso, o BigQuery faz full scan de TODAS as tabelas, gerando custo altissimo.
+    correct_example: |
+      SELECT *
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+    incorrect_example: |
+      -- ERRADO: causa full table scan (custo alto, lento)
+      SELECT *
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE event_date >= '{date_start}'
+
+  - id: 2
+    title: "event_params e ARRAY — requer UNNEST com subquery"
+    severity: critical
+    description: >
+      O campo event_params e um ARRAY de STRUCTs. Para extrair um parametro especifico,
+      usar uma subquery correlacionada com UNNEST. NAO tentar acessar event_params diretamente
+      como se fosse um campo simples. Cada parametro tem key (nome) e value (com sub-campos
+      string_value, int_value, float_value, double_value).
+    correct_example: |
+      SELECT
+        event_name,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_location,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source') AS source,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium') AS medium,
+        (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS ga_session_id
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+    incorrect_example: |
+      -- ERRADO: event_params nao e um campo escalar
+      SELECT event_params.page_location
+      FROM `{project_id}.{dataset}.events_*`
+
+      -- ERRADO: falta UNNEST
+      SELECT event_params.key, event_params.value
+      FROM `{project_id}.{dataset}.events_*`
+
+  - id: 3
+    title: "items e ARRAY — requer CROSS JOIN UNNEST para e-commerce"
+    severity: critical
+    description: >
+      O campo items e um ARRAY de STRUCTs com dados de produtos/itens. Para acessar
+      dados de itens individuais, usar CROSS JOIN UNNEST(items) AS item. Isso expande
+      cada item em uma linha separada. Essencial para analises de e-commerce como
+      produtos mais vendidos, categorias, etc.
+    correct_example: |
+      -- Produtos mais vendidos
+      SELECT
+        item.item_name,
+        item.item_category,
+        COUNT(*) AS total_purchases,
+        SUM(item.quantity) AS total_quantity,
+        SUM(item.item_revenue) AS total_revenue
+      FROM `{project_id}.{dataset}.events_*`,
+        UNNEST(items) AS item
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        AND event_name = 'purchase'
+      GROUP BY item.item_name, item.item_category
+      ORDER BY total_revenue DESC
+      LIMIT 20
+    incorrect_example: |
+      -- ERRADO: items e ARRAY, nao pode acessar diretamente
+      SELECT items.item_name, items.price
+      FROM `{project_id}.{dataset}.events_*`
+
+      -- ERRADO: falta UNNEST
+      SELECT item_name FROM `{project_id}.{dataset}.events_*`
+
+  - id: 4
+    title: "Receita: ecommerce.purchase_revenue vs event_param 'value'"
+    severity: high
+    description: >
+      A receita de compras pode estar em dois lugares: ecommerce.purchase_revenue (campo STRUCT)
+      ou no event_param com key = 'value' (extraido via UNNEST). Para analises de receita total,
+      preferir ecommerce.purchase_revenue quando disponivel. O event_param 'value' pode conter
+      receita em outros eventos alem de purchase (como ad_impression). Usar COALESCE para garantir
+      cobertura quando um dos campos estiver NULL.
+    correct_example: |
+      -- Receita total de compras
+      SELECT
+        PARSE_DATE('%Y%m%d', event_date) AS data,
+        COUNT(DISTINCT ecommerce.transaction_id) AS transacoes,
+        SUM(ecommerce.purchase_revenue) AS receita_ecommerce,
+        SUM((SELECT value.float_value FROM UNNEST(event_params) WHERE key = 'value')) AS receita_event_param,
+        SUM(
+          COALESCE(
+            ecommerce.purchase_revenue,
+            (SELECT value.float_value FROM UNNEST(event_params) WHERE key = 'value')
+          )
+        ) AS receita_total
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        AND event_name = 'purchase'
+      GROUP BY data
+      ORDER BY data
+    incorrect_example: |
+      -- INCOMPLETO: pode perder receita se campo estiver em outro local
+      SELECT SUM(ecommerce.purchase_revenue) AS receita
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE event_name = 'purchase'
+
+  - id: 5
+    title: "ga_session_id esta em event_params, nao e campo direto"
+    severity: critical
+    description: >
+      O ID da sessao (ga_session_id) e o numero da sessao (ga_session_number) NAO sao
+      campos de nivel superior. Eles estao dentro de event_params e precisam ser extraidos
+      via UNNEST. ga_session_id e int_value, nao string_value. O mesmo vale para
+      ga_session_number e engagement_time_msec.
+    correct_example: |
+      SELECT
+        user_pseudo_id,
+        (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+        (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_number') AS session_number,
+        (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'engagement_time_msec') AS engagement_ms
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+    incorrect_example: |
+      -- ERRADO: ga_session_id nao e campo de nivel superior
+      SELECT ga_session_id FROM `{project_id}.{dataset}.events_*`
+
+      -- ERRADO: ga_session_id e int_value, nao string_value
+      SELECT (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id
+      FROM `{project_id}.{dataset}.events_*`
+
+  - id: 6
+    title: "Sessao unica = user_pseudo_id + ga_session_id"
+    severity: high
+    description: >
+      Uma sessao unica no GA4 e identificada pela combinacao de user_pseudo_id + ga_session_id.
+      Apenas ga_session_id NAO e unico entre usuarios diferentes. Sempre usar CONCAT ou
+      agrupar por ambos os campos ao contar sessoes unicas.
+    correct_example: |
+      -- Contar sessoes unicas
+      SELECT
+        COUNT(DISTINCT CONCAT(
+          user_pseudo_id, '-',
+          CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+        )) AS sessoes_unicas
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+
+      -- Sessoes por fonte de trafego
+      SELECT
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source') AS source,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'medium') AS medium,
+        COUNT(DISTINCT CONCAT(
+          user_pseudo_id, '-',
+          CAST((SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS STRING)
+        )) AS sessoes
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+        AND event_name = 'session_start'
+      GROUP BY source, medium
+      ORDER BY sessoes DESC
+    incorrect_example: |
+      -- ERRADO: ga_session_id sozinho nao identifica sessao unica
+      SELECT
+        COUNT(DISTINCT (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id'))
+          AS sessoes
+      FROM `{project_id}.{dataset}.events_*`
+
+  - id: 7
+    title: "Sintaxe correta de _TABLE_SUFFIX com wildcard tables"
+    severity: critical
+    description: >
+      Ao usar tabelas wildcard (events_*), a sintaxe de referencia deve usar backticks
+      e o formato completo project.dataset.events_*. O filtro _TABLE_SUFFIX recebe
+      strings no formato YYYYMMDD (sem hifens). BETWEEN e inclusivo em ambos os lados.
+    correct_example: |
+      -- Formato correto com backticks e projeto completo
+      SELECT event_name, COUNT(*) AS total
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '20260101' AND '20260215'
+      GROUP BY event_name
+      ORDER BY total DESC
+
+      -- Tambem valido: >= e <=
+      SELECT *
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX >= '20260201'
+        AND _TABLE_SUFFIX <= '20260215'
+
+      -- Dia especifico
+      SELECT *
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX = '20260215'
+    incorrect_example: |
+      -- ERRADO: data com hifens
+      WHERE _TABLE_SUFFIX BETWEEN '2026-01-01' AND '2026-02-15'
+
+      -- ERRADO: sem backticks
+      FROM {project_id}.{dataset}.events_*
+
+      -- ERRADO: sem asterisco (tabela especifica nao usa _TABLE_SUFFIX)
+      FROM `{project_id}.{dataset}.events_20260215`
+      WHERE _TABLE_SUFFIX = '20260215'
+
+  - id: 8
+    title: "event_params values tem multiplos tipos — usar o tipo correto"
+    severity: high
+    description: >
+      Cada parametro em event_params tem value com 4 sub-campos de tipo (string_value,
+      int_value, float_value, double_value). Apenas UM deles tera valor preenchido.
+      Usar o tipo errado retorna NULL silenciosamente, sem erro. Mapeamento dos tipos
+      mais comuns: string_value para page_location, source, medium, campaign, page_title,
+      page_referrer; int_value para ga_session_id, ga_session_number, engagement_time_msec,
+      entrances, session_engaged; float_value para value (receita).
+    correct_example: |
+      SELECT
+        -- Strings: usar string_value
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'page_location') AS page_url,
+        (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'source') AS source,
+        -- Inteiros: usar int_value
+        (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'ga_session_id') AS session_id,
+        (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'engagement_time_msec') AS engagement_ms,
+        -- Floats: usar float_value
+        (SELECT value.float_value FROM UNNEST(event_params) WHERE key = 'value') AS event_value
+      FROM `{project_id}.{dataset}.events_*`
+      WHERE _TABLE_SUFFIX BETWEEN '{date_start}' AND '{date_end}'
+    incorrect_example: |
+      -- ERRADO: ga_session_id e int_value, nao string_value (retorna NULL)
+      (SELECT value.string_value FROM UNNEST(event_params) WHERE key = 'ga_session_id')
+
+      -- ERRADO: page_location e string_value, nao int_value (retorna NULL)
+      (SELECT value.int_value FROM UNNEST(event_params) WHERE key = 'page_location')

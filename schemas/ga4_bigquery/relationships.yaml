@@ -1,0 +1,8 @@
+source_name: ga4_bigquery
+description: >
+  GA4 BigQuery Export usa uma unica tabela denormalizada (events_*).
+  Nao existem JOINs entre tabelas — os relacionamentos sao internos
+  via UNNEST de campos ARRAY (event_params, items).
+
+relationships: []
+note: "GA4 uses a single denormalized events table. Relationships are within the table via UNNEST patterns (event_params, items)."
